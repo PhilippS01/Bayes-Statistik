@@ -1,1 +1,20 @@
+# macOS
 .DS_Store
+
+# R and RStudio
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# R temporary files
+.Rtmp*/
+.Rcheck/
+
+# R package management (if using renv)
+renv/library/
+renv/staging/
+
+# Temporary files
+*.Rproj.user
+*~
