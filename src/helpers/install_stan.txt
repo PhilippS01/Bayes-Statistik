@@ -1,0 +1,28 @@
+# ----------------------------
+Copy this in your notebook to install stan
+# ----------------------------
+
+```{r}
+install.packages(c(
+  "tidyverse",
+  "here",
+  "knitr",
+  "posterior",
+  "bayesplot",
+  "tidybayes"
+))
+
+install.packages(
+  "cmdstanr",
+  repos = c(
+    "https://stan-dev.r-universe.dev",
+    getOption("repos")
+  )
+)
+
+# Install Stan itself (requires C++ toolchain)
+cmdstanr::install_cmdstan()
+
+# Verify installation
+cmdstanr::cmdstan_version()
+```

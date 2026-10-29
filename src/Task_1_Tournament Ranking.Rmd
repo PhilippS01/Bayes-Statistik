@@ -1,0 +1,307 @@
+---
+title: "Task 1 Tournament Ranking "
+subtitle: |
+  105.173 Bayesian Statistics
+author: |
+  Philipp Schott
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: false
+    fig_caption: true
+---
+
+------------------------------------------------------------------------
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center",
+  out.width = "\\linewidth"
+)
+
+# Required packages
+packages <- c(
+  # Data preparation and reporting
+  "tidyverse",
+  "here",
+  "knitr",
+
+  # Bayesian inference with Stan
+  "cmdstanr",
+  "posterior",
+
+  # Posterior analysis and visualization
+  "bayesplot",
+  "tidybayes"
+)
+
+# Check whether all required packages are installed
+missing_packages <- packages[
+  !packages %in% installed.packages()[, "Package"]
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(missing_packages, collapse = ", "),
+    ". Please install them before running this document."
+  )
+}
+
+# Load packages
+library(tidyverse)
+library(here)
+library(knitr)
+
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidybayes)
+```
+
+\newpage
+
+# Data Description
+
+The first step is to load and inspect the provided dataset to understand its structure and verify its completeness before proceeding with the Bayesian rating model.
+
+```{r}
+# Load dataset
+games <- read.csv("../data/games.csv")
+
+# Basic characteristics
+str(games)
+cat("Missing values:" , sum(is.na(games)))
+```
+The dataset contains 862 chess games played between different chess engines. Each observation represents one game and includes four variables: white, black, result, and timecontrol.
+
+The variables white and black identify the participating engines and their respective colors. The variable result records the outcome of the game from White's perspective, while timecontrol specifies the time-control setting.
+
+All 862 observations are complete, with no missing values across the four variables. Therefore, no missing-value imputation is required.
+
+```{r}
+# Extract basic characteristcs
+engines <- sort(unique(c(games$white, games$black)))
+
+length(engines)
+engines
+table(games$result)
+```
+
+# Bayesian Rating Model
+
+## Binary Model
+
+### Data Preparation for Stan
+
+```{r}
+# Engine labels
+engines <- sort(unique(c(games$white, games$black)))
+
+# First prototype: only decisive games
+decisive <- subset(games, result %in% c("1-0", "0-1"))
+
+# Stan requires numeric engine indices
+stan_data <- list(
+  N = nrow(decisive),
+  K = length(engines),
+  white = match(decisive$white, engines),
+  black = match(decisive$black, engines),
+  white_win = as.integer(decisive$result == "1-0")
+)
+
+str(stan_data)
+```
+
+### Posterior Sampling
+
+```{r, results='hide'}
+# Find Stan file
+stan_file <-"helpers/rating_binary.stan"
+
+# Compile Stan model 1
+mod_1 <- cmdstan_model(stan_file)
+
+# Sample from posterior
+fit_binary <- mod_1$sample(
+  data = stan_data,
+  seed = 42
+)
+```
+
+## later (inkluding draws; idk, just experimental for now?)
+
+### Data Preparation for Stan
+
+```{r}
+engines <- sort(unique(c(games$white, games$black)))
+
+# Encode outcomes:
+# 1 = White win, 2 = Draw, 3 = Black win
+outcome_levels <- c("1-0", "1/2-1/2", "0-1")
+
+stan_data <- list(
+  N = nrow(games),
+  K = length(engines),
+  white = match(games$white, engines),
+  black = match(games$black, engines),
+  outcome = match(games$result, outcome_levels)
+)
+
+table(stan_data$outcome)
+```
+
+### Posterior Sampling
+
+```{r, results='hide'}
+stan_file <- "helpers/rating_three_outcomes.stan"
+
+# Compile Stan model 2
+mod_2 <- cmdstan_model(stan_file)
+
+fit_full <- mod_2$sample(
+  data = stan_data,
+  seed = 42
+)
+```
+
+# Results
+
+## Engine Rankings
+
+```{r}
+
+# Create a ranking table from posterior rating samples
+ranking_table <- function(fit, engines) {
+
+  # Extract posterior samples for all engine ratings
+  draws <- as.matrix(
+    fit$draws(
+      variables = "rating",
+      format = "draws_matrix"
+    )
+  )
+
+  # Summarize each engine's posterior rating distribution
+  result <- data.frame(
+    Engine = engines,
+    Mean = colMeans(draws),
+    SD = apply(draws, 2, sd),
+    Lower = apply(draws, 2, quantile, probs = 0.05),
+    Upper = apply(draws, 2, quantile, probs = 0.95)
+  )
+
+  # Rank engines by expected rating (highest first)
+  result <- result[order(-result$Mean), ]
+  rownames(result) <- NULL
+
+  return(result)
+}
+
+# Generate separate rankings for both models
+ranking_A <- ranking_table(fit_binary, engines)
+ranking_B <- ranking_table(fit_full, engines)
+```
+
+
+```{r, echo=FALSE}
+# Render table
+knitr::kable(
+  ranking_A,
+  digits = 1,
+  col.names = c("Engine", "Mean Rating", "SD", "Lower 90%", "Upper 90%"),
+  caption = "Model A: Bayesian Engine Ranking (Binary Outcomes)",
+  booktabs = TRUE,
+  row.names = FALSE
+)
+```
+
+```{r}
+# Render table
+knitr::kable(
+  ranking_B,
+  digits = 1,
+  col.names = c("Engine", "Mean Rating", "SD", "Lower 90%", "Upper 90%"),
+  caption = "Model B: Bayesian Engine Ranking (Including Draws)",
+  booktabs = TRUE,
+  row.names = FALSE
+)
+```
+
+In both the complex and the simpler model we get the same ranking order. Notice as 
+
+$$R_j - Ri = (R_j + m) - (R_i + m)$$
+
+the absolute value of a rating isn't that informative.
+
+## Pairwise Superiority
+
+```{r}
+
+# Calculate pairwise superiority probabilities from posterior samples
+superiority_table <- function(fit, engines) {
+
+  # Extract posterior rating samples for all engines
+  draws <- as.matrix(fit$draws(
+    variables = paste0("rating[", seq_along(engines), "]"),
+    format = "draws_matrix"
+  ))
+
+  # Number of engines
+  K <- length(engines)
+
+  # Initialize matrix for pairwise superiority probabilities
+  probs <- matrix(
+    NA_real_, K, K,
+    dimnames = list(engines, engines)
+  )
+
+  # Compare each engine with every other engine
+  for (i in seq_len(K)) {
+    for (j in seq_len(K)) {
+      if (i != j) {
+
+        # Proportion of posterior samples where engine i
+        # has a higher rating than engine j
+        probs[i, j] <- mean(draws[, i] > draws[, j])
+      }
+    }
+  }
+
+  return(probs)
+}
+
+# Calculate superiority probabilities for both models
+superiority_A <- superiority_table(fit_binary, engines)
+superiority_B <- superiority_table(fit_full, engines)
+```
+
+```{r, echo=FALSE}
+knitr::kable(round(superiority_A, 3),
+             caption = "Model A: Pairwise superiority")
+
+knitr::kable(round(superiority_B, 3),
+             caption = "Model B: Pairwise superiority")
+```
+
+## Tier List
+
+We define superiority as a posterior probability of at least 95% that one engine has a higher rating than another.
+
+| Tier | Engines |
+|---|---|
+| 1 | E |
+| 2 | A, SM |
+| 3 | C, B |
+| 4 | D |
+
+Both models yield the same ranking: E > A > SM > C > B > D.
+
+Model B supports the proposed tier boundaries, while differences within Tiers 2 and 3 remain uncertain. Model A provides weaker evidence for some tier boundaries. Therefore, the tier classification is based on Model B.
