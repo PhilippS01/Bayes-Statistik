@@ -68,6 +68,10 @@ library(tidybayes)
 
 \newpage
 
+---
+Note: this document is not finalized!
+---
+
 # Data Description
 
 The first step is to load and inspect the provided dataset to understand its structure and verify its completeness before proceeding with the Bayesian rating model.

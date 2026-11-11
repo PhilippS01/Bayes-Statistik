@@ -1,0 +1,83 @@
+---
+title: "Task 2 Tournament Ranking with Time Control"
+subtitle: |
+  105.173 Bayesian Statistics
+author: |
+  Philipp Schott
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: false
+    fig_caption: true
+---
+
+------------------------------------------------------------------------
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center",
+  out.width = "\\linewidth"
+)
+
+# Required packages
+packages <- c(
+  # Data preparation and reporting
+  "tidyverse",
+  "here",
+  "knitr",
+
+  # Bayesian inference with Stan
+  "cmdstanr",
+  "posterior",
+
+  # Posterior analysis and visualization
+  "bayesplot",
+  "tidybayes"
+)
+
+# Check whether all required packages are installed
+missing_packages <- packages[
+  !packages %in% installed.packages()[, "Package"]
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(missing_packages, collapse = ", "),
+    ". Please install them before running this document."
+  )
+}
+
+# Load packages
+library(tidyverse)
+library(here)
+library(knitr)
+
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidybayes)
+```
+
+\newpage
+
+# Load Data
+
+```{r}
+# Load dataset
+games <- read.csv("../../../data/games.csv")
+
+# Basic characteristics
+str(games)
+cat("Missing values:" , sum(is.na(games)))
+```
+
+# Task 2
+
