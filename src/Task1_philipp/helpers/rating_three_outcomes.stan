@@ -1,4 +1,3 @@
-
 data {
   int<lower=1> N;
   int<lower=1> K;
@@ -31,9 +30,9 @@ model {
     p_draw = 2 * draw_tendency * e * (1 - e);
 
     // Probabilities of all three outcomes
-    p[1] = e - 0.5 * p_draw;
-    p[2] = p_draw;
-    p[3] = 1 - e - 0.5 * p_draw;
+    p[1] = e - 0.5 * p_draw;       // White wins
+    p[2] = p_draw;                 // Draw
+    p[3] = 1 - e - 0.5 * p_draw;   // Black wins
 
     outcome[n] ~ categorical(p);
   }

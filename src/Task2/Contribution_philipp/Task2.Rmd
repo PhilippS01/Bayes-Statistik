@@ -32,6 +32,7 @@ packages <- c(
   "tidyverse",
   "here",
   "knitr",
+  "ggplot2",
 
   # Bayesian inference with Stan
   "cmdstanr",
@@ -59,11 +60,15 @@ if (length(missing_packages) > 0) {
 library(tidyverse)
 library(here)
 library(knitr)
+library(ggplot2)
 
 library(cmdstanr)
 library(posterior)
 library(bayesplot)
 library(tidybayes)
+
+# Set a global seed
+set.seed(42)
 ```
 
 \newpage
@@ -81,3 +86,182 @@ cat("Missing values:" , sum(is.na(games)))
 
 # Task 2
 
+## Collecting Ideas
+
+When reading the assignment I have 2 main ideas:
+
+- Idea 1: we assume that different time controls represent different game modes, therefore different distributions in rating. My first idea would be to model a hierarchical model capturing the different populations of games assuming a general underlying player strength.
+
+- Idea 2: Besides the general underlying player strength players could have strength in different game modes eg., R1 \> R2 for one game mode but R1 \< R2 in a different game mode.
+
+## Continue with Idea 2
+
+By further reading, I think Idea 2 is expected one. Therefore I will continue with that one as we by the note we assume linear dependence of timecontrol, ie.:
+
+$$\boxed{R_j(t_c)=\alpha_j+\beta_j x(t_c)}$$
+
+where $x(t_c)$ is the z-scaled game duration.
+
+- $\alpha_j$: Base strength of engine $j$, modeled in exactly the same way as \(R_j\) in Task 1 (with draws).
+- $\beta_j$: How its strength changes with thinking time, with $$\beta_j\sim\mathcal N(0,100^2).$$
+- $t_c=\text{time}+40\cdot\text{increment}$: time as a numeric variable.
+
+### Data Preparation for Stan
+
+```{r}
+# Engine identifiers
+engines <- sort(unique(c(games$white, games$black)))
+
+# Convert time controls into expected game duration
+parts <- strsplit(games$timecontrol, "\\+")
+
+tc <- vapply(parts, function(p) {
+  as.numeric(p[1]) + 40 * as.numeric(p[2])
+}, numeric(1))
+
+# Standardize time control
+tc_center <- mean(tc)
+tc_scale <- sd(tc)
+stopifnot(is.finite(tc_scale), tc_scale > 0)
+
+x <- (tc - tc_center) / tc_scale
+
+# Encode the three game outcomes
+outcome_levels <- c("1-0", "1/2-1/2", "0-1")
+
+# Data for the time-control model
+stan_data_tc <- list(
+  N = nrow(games),
+  K = length(engines),
+  white = match(games$white, engines),
+  black = match(games$black, engines),
+  outcome = match(games$result, outcome_levels),
+  x = as.numeric(x)
+)
+```
+
+### Posterior Sampling
+
+```{r, results='hide'}
+# Compile time-control model
+mod_tc <- cmdstan_model("helpers/rating_timecontrol.stan")
+
+# Sample from the posterior
+fit_tc <- mod_tc$sample(
+  data = stan_data_tc,
+  seed = 42
+)
+```
+
+```{r, echo=FALSE}
+# Parameter estimates and MCMC diagnostics
+summary_tc <- fit_tc$summary(
+  variables = c("intercept", "slope", "draw_tendency")
+)
+
+knitr::kable(
+  summary_tc[, c(
+    "variable", "mean", "sd", "rhat", "ess_bulk", "ess_tail"
+  )],
+  digits = 3,
+  caption = "Time-Control Model: Posterior Summary and Diagnostics"
+)
+```
+
+The MCMC diagnostics indicate satisfactory sampling performance. All R-hat values are close to 1, all bulk effective sample sizes exceed 1,000 and all tail effective sample sizes exceed 100. Thus, the sampling diagnostics do not indicate convergence problems.
+
+# Results
+
+```{r, echo=FALSE}
+# Extract estimated baseline ratings
+base_ranking <- fit_tc$summary(variables = "intercept")
+
+base_ranking$Engine <- engines
+
+base_ranking <- base_ranking[
+  order(-base_ranking$mean),
+  c("Engine", "mean", "sd")
+]
+
+knitr::kable(
+  base_ranking,
+  digits = 1,
+  caption = "Engine Ranking at Average Time Control"
+)
+```
+
+The estimated ratings at the average time control are very similar to those obtained in Task 1, yielding the same ranking: E > A > SM > C > B > D. Posterior standard deviations are also comparable. However, the time-dependent model additionally allows relative engine strengths to change across different time controls.
+
+```{r}
+# Extract posterior samples for base ratings and time effects
+alpha <- as.matrix(fit_tc$draws(
+  variables = "intercept", format = "draws_matrix"
+))
+
+beta <- as.matrix(fit_tc$draws(
+  variables = "slope", format = "draws_matrix"
+))
+
+# Calculate engine ratings at a given time control
+rating_at_time <- function(t) {
+  x <- (t - tc_center) / tc_scale
+  alpha + beta * x
+}
+```
+
+We visualize the posterior mean ratings across different time controls to examine how engine strength changes with game duration.
+
+```{r}
+# Define time controls from 15 to 600 seconds
+times <- seq(15, 600, length.out = 100)
+
+# Calculate expected ratings for each engine and time control
+ratings <- t(sapply(times, function(t) {
+  colMeans(rating_at_time(t))
+}))
+
+# Plot time-dependent ratings for all engines
+matplot(times, ratings, type = "l", lty = 1,
+        xlab = "Time Control (seconds)",
+        ylab = "Expected Rating")
+
+legend("topright", legend = engines,
+       col = 1:6, lty = 1, bty = "n")
+```
+
+The plot shows that Engine E remains the strongest, while the other engines exhibit different time-dependent trends, motivating separate tier lists for the four specified time controls.
+
+```{r}
+# Rank engines based on their ratings at a given time control
+tier_ranking <- function(t) {
+  draws <- rating_at_time(t)
+  means <- colMeans(draws)
+  idx <- order(-means)
+
+  # Calculate superiority probabilities between neighboring engines
+  p <- sapply(1:(length(engines) - 1), function(i) {
+    mean(draws[, idx[i]] > draws[, idx[i + 1]])
+  })
+
+  # Assign a new tier if superiority probability exceeds 95%
+  data.frame(
+    Tier = c(1, 1 + cumsum(p >= 0.95)),
+    Engine = engines[idx],
+    Mean = means[idx],
+    SD = apply(draws, 2, sd)[idx]
+  )
+}
+```
+
+```{r, echo=FALSE}
+# Generate tier lists for the four requested time controls
+knitr::kable(tier_ranking(15), digits = 1, caption = "Tier List: 15+0")
+
+knitr::kable(tier_ranking(60), digits = 1, caption = "Tier List: 60+0")
+
+knitr::kable(tier_ranking(260), digits = 1, caption = "Tier List: 180+2")
+
+knitr::kable(tier_ranking(600), digits = 1, caption = "Tier List: 600+0")
+```
+
+Engine E consistently occupies the highest tier, while the remaining rankings change with time control. Particularly at 600+0, increased posterior uncertainty prevents a clear separation of the other engines under our 95% superiority criterion.

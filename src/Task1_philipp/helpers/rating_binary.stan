@@ -1,4 +1,3 @@
-
 data {
   int<lower=1> N; // Number of decisive games (782)
   int<lower=1> K; // Number of engines (6)

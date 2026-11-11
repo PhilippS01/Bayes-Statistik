@@ -181,7 +181,6 @@ fit_full <- mod_2$sample(
 ## Engine Rankings
 
 ```{r}
-
 # Create a ranking table from posterior rating samples
 ranking_table <- function(fit, engines) {
 
@@ -214,7 +213,6 @@ ranking_A <- ranking_table(fit_binary, engines)
 ranking_B <- ranking_table(fit_full, engines)
 ```
 
-
 ```{r, echo=FALSE}
 # Render table
 knitr::kable(
@@ -227,7 +225,7 @@ knitr::kable(
 )
 ```
 
-```{r}
+```{r, echo=FALSE}
 # Render table
 knitr::kable(
   ranking_B,
@@ -248,7 +246,6 @@ the absolute value of a rating isn't that informative.
 ## Pairwise Superiority
 
 ```{r}
-
 # Calculate pairwise superiority probabilities from posterior samples
 superiority_table <- function(fit, engines) {
 
@@ -288,11 +285,9 @@ superiority_B <- superiority_table(fit_full, engines)
 ```
 
 ```{r, echo=FALSE}
-knitr::kable(round(superiority_A, 3),
-             caption = "Model A: Pairwise superiority")
+knitr::kable(round(superiority_A, 3), caption = "Model A: Pairwise superiority")
 
-knitr::kable(round(superiority_B, 3),
-             caption = "Model B: Pairwise superiority")
+knitr::kable(round(superiority_B, 3), caption = "Model B: Pairwise superiority")
 ```
 
 ## Tier List

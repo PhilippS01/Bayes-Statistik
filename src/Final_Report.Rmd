@@ -178,7 +178,6 @@ fit_full <- mod_2$sample(
 ### Engine Rankings
 
 ```{r}
-
 # Create a ranking table from posterior rating samples
 ranking_table <- function(fit, engines) {
 
@@ -224,7 +223,7 @@ knitr::kable(
 )
 ```
 
-```{r}
+```{r, echo=FALSE}
 # Render table
 knitr::kable(
   ranking_B,
@@ -245,7 +244,6 @@ the absolute value of a rating isn't that informative.
 ### Pairwise Superiority
 
 ```{r}
-
 # Calculate pairwise superiority probabilities from posterior samples
 superiority_table <- function(fit, engines) {
 
