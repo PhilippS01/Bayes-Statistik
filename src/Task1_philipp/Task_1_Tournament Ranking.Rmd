@@ -140,7 +140,7 @@ fit_binary <- mod_1$sample(
 )
 ```
 
-## later (inkluding draws; idk, just experimental for now?)
+## Model including draws
 
 ### Data Preparation for Stan
 

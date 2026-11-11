@@ -28,7 +28,7 @@ model {
 
     real logit_p;
 
-    // Elo formula given in the task
+    // Expected score for Elo (formula given in the task)
     logit_p = 1 / (1 + pow(10.0, (rating[black[n]] - rating[white[n]]) / 400));
 
     // Binary game-outcome model

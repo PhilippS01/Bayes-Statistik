@@ -24,11 +24,8 @@ model {
     real p_draw;
     vector[3] p;
 
-    // Expected score from Elo ratings
-    e = inv_logit(
-      log(10.0) / 400 *
-      (rating[white[n]] - rating[black[n]])
-    );
+    // Expected score for Elo (formula given in the task)
+    e = 1 / (1 + pow(10.0, (rating[black[n]] - rating[white[n]]) / 400));
 
     // Draw probability
     p_draw = 2 * draw_tendency * e * (1 - e);
