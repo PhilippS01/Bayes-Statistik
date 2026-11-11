@@ -1,5 +1,5 @@
 ---
-title: "Task 1 Tournament Ranking "
+title: "Task 1 Tournament Ranking"
 subtitle: |
   105.173 Bayesian Statistics
 author: |
@@ -74,7 +74,7 @@ The first step is to load and inspect the provided dataset to understand its str
 
 ```{r}
 # Load dataset
-games <- read.csv("../data/games.csv")
+games <- read.csv("../../data/games.csv")
 
 # Basic characteristics
 str(games)
