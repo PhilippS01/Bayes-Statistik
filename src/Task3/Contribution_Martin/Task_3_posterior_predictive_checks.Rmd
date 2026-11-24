@@ -1,0 +1,1783 @@
+---
+title: "Task 3 Posterior predictive checks"
+subtitle: |
+  105.173 Bayesian Statistics
+author: |
+  Martin Palmetzhofer
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: false
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+# NOTE: I copied this section from task 2, maybe not all packages are required here, or additional ones need to be added
+# Global chunk options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center",
+  out.width = "\\linewidth"
+)
+
+# Required packages
+packages <- c(
+  # Data preparation and reporting
+  "tidyverse",
+  "here",
+  "knitr",
+  "ggplot2",
+
+  # Bayesian inference with Stan
+  "cmdstanr",
+  "posterior",
+
+  # Posterior analysis and visualization
+  "bayesplot",
+  "tidybayes"
+)
+
+# Check whether all required packages are installed
+missing_packages <- packages[
+  !packages %in% installed.packages()[, "Package"]
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(missing_packages, collapse = ", "),
+    ". Please install them before running this document."
+  )
+}
+
+# Load packages
+library(tidyverse)
+library(here)
+library(knitr)
+library(ggplot2)
+
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidybayes)
+
+# Set a global seed
+set.seed(42)
+```
+
+\newpage
+
+
+
+# Approach for posterior predictive checks
+The goal of posterior predictive checks it whether the fitted models reproduce statistical features of the observed data. Therefore we use our posterior draws of engine ratings and other parameters like draw tendency to produce new tournament data and calculate the same summary statistics for the actual tournament and for each replicate.
+
+We plot the observed statistics alongside their posterior predictive distributions and use this to guide a revision if needed. We then repeat the checks and record what changed, why, and whether the revision improved the fit.
+
+## Model without time control
+
+### Load Data
+
+```{r}
+# Load dataset
+games <- read.csv("../../../data/games.csv")
+
+# Basic characteristics
+str(games)
+cat("Missing values:" , sum(is.na(games)))
+```
+
+### Data Preparation for Stan
+
+```{r}
+engines <- sort(unique(c(games$white, games$black)))
+
+# Encode outcomes:
+# 1 = White win, 2 = Draw, 3 = Black win
+outcome_levels <- c("1-0", "1/2-1/2", "0-1")
+
+stan_data <- list(
+  N = nrow(games),
+  K = length(engines),
+  white = match(games$white, engines),
+  black = match(games$black, engines),
+  outcome = match(games$result, outcome_levels)
+)
+
+table(stan_data$outcome)
+```
+
+### Posterior Sampling
+
+```{r}
+stan_file <- "helpers/rating_three_outcomes.stan"
+
+# Compile Stan model 2
+three_outcome_initial <- cmdstan_model(stan_file)
+
+three_outcome_initial_fitted <- three_outcome_initial$sample(
+  data = stan_data,
+  seed = 42
+)
+```
+### Extract the fitted ratings and draw tendencies
+```{r}
+rating_names <- paste0("rating[", seq_along(engines), "]")
+
+posterior_draws <- as.matrix(three_outcome_initial_fitted$draws(
+  variables = c(rating_names, "draw_tendency"),
+  format = "draws_matrix"
+))
+
+ratings <- posterior_draws[, rating_names, drop = FALSE]
+draw_tendency <- posterior_draws[, "draw_tendency"]
+```
+
+
+### Simulate Tournament
+```{r}
+
+
+outcome_rep <- vapply(seq_len(nrow(ratings)), function(s) {
+  white_rating <- ratings[s, stan_data$white]
+  black_rating <- ratings[s, stan_data$black]
+
+  e <- 1 / (1 + 10^((black_rating - white_rating) / 400))
+
+  p_draw <- 2 * draw_tendency[s] * e * (1 - e)
+  p_white <- e - 0.5 * p_draw
+
+  u <- runif(stan_data$N)
+
+  ifelse(u < p_white, 1L,
+         ifelse(u < p_white + p_draw, 2L, 3L))
+}, FUN.VALUE = integer(stan_data$N))
+```
+
+### Compare
+```{r}
+observed_draws <- sum(stan_data$outcome == 2L)
+simulated_draws <- colSums(outcome_rep == 2L)
+
+hist(
+  simulated_draws,
+  main = "Posterior predictive check: total draws",
+  xlab = "Number of draws per replicated tournament",
+  xlim = range(c(simulated_draws, observed_draws))
+)
+abline(v = observed_draws, col = "red", lwd = 2)
+
+observed_draws
+quantile(simulated_draws, probs = c(0.05, 0.50, 0.95))
+```
+The observed count of 80 draws in the actual tournament lies near the center of the posterior predictive distribution, so the model reproduces the overall number of draws reasonably well.
+
+```{r}
+observed <- stan_data$outcome
+
+observed_score <- (observed == 1L) + 0.5 * (observed == 2L)
+simulated_score <- (outcome_rep == 1L) + 0.5 * (outcome_rep == 2L)
+
+observed_draw <- observed == 2L
+simulated_draw <- outcome_rep == 2L
+```
+
+
+```{r}
+observed_white_wins <- sum(observed == 1L)
+replicated_white_wins <- colSums(outcome_rep == 1L)
+
+observed_white_wins
+quantile(replicated_white_wins, c(0.05, 0.50, 0.95))
+```
+Here we clearely see that the model underpredicts the win probability for white, we can therefore try to inprove the model by adding another parameter.
+
+### Model adjustment: White advantage
+Based on the discrepencies above i suggest and will now try a scalar white advantage parameter that is equal for every model.
+
+$$e_n = \frac{1}{1 + 10^{(\Delta_n)/400}}$$
+where $\Delta_n$ is now defined as:
+
+$$\Delta_n = R_{\text{Black},n} - (R_{\text{White},n} + \text{whiteAdvantage})$$
+
+### New model after iteration 1
+```{r}
+stan_file_1 <- "helpers/rating_three_outcomes_first_iteration.stan"
+
+# Compile Stan model 2
+three_outcome_iteration_1 <- cmdstan_model(stan_file_1)
+
+three_outcome_iteration_1_fitted <- three_outcome_iteration_1$sample(
+  data = stan_data,
+  seed = 42
+)
+```
+
+### Extract the fitted ratings and draw tendencies
+```{r}
+rating_names <- paste0("rating[", seq_along(engines), "]")
+
+posterior_draws_1 <- as.matrix(three_outcome_iteration_1_fitted$draws(
+  variables = c(rating_names, "draw_tendency", "white_advantage"),
+  format = "draws_matrix"
+))
+
+ratings <- posterior_draws_1[, rating_names, drop = FALSE]
+draw_tendency <- posterior_draws_1[, "draw_tendency"]
+white_advantage <- posterior_draws_1[, "white_advantage"]
+```
+
+### Simulate Tournament
+```{r}
+
+
+outcome_rep <- vapply(seq_len(nrow(ratings)), function(s) {
+  white_rating <- ratings[s, stan_data$white]
+  black_rating <- ratings[s, stan_data$black]
+  
+  e <- 1 / (1 + 10^((black_rating - (white_rating + white_advantage[s])) / 400))
+
+  p_draw <- 2 * draw_tendency[s] * e * (1 - e)
+  p_white <- e - 0.5 * p_draw
+
+  u <- runif(stan_data$N)
+
+  ifelse(u < p_white, 1L,
+         ifelse(u < p_white + p_draw, 2L, 3L))
+}, FUN.VALUE = integer(stan_data$N))
+```
+
+### Compare
+```{r}
+observed_draws <- sum(stan_data$outcome == 2L)
+simulated_draws <- colSums(outcome_rep == 2L)
+
+hist(
+  simulated_draws,
+  main = "Posterior predictive check: total draws",
+  xlab = "Number of draws per replicated tournament",
+  xlim = range(c(simulated_draws, observed_draws))
+)
+abline(v = observed_draws, col = "red", lwd = 2)
+
+observed_draws
+quantile(simulated_draws, probs = c(0.05, 0.50, 0.95))
+```
+This stayed unchanged and the model satisfies the posterior check.
+```{r}
+observed <- stan_data$outcome
+
+observed_score <- (observed == 1L) + 0.5 * (observed == 2L)
+simulated_score <- (outcome_rep == 1L) + 0.5 * (outcome_rep == 2L)
+
+observed_draw <- observed == 2L
+simulated_draw <- outcome_rep == 2L
+```
+
+
+```{r}
+observed_white_wins <- sum(observed == 1L)
+replicated_white_wins <- colSums(outcome_rep == 1L)
+
+observed_white_wins
+quantile(replicated_white_wins, c(0.05, 0.50, 0.95))
+```
+Now the median of the posterior distribution matches the amount of white wins from the actual tournament pretty exactly.
+
+As both draws and white wins are satisfactory we do not need to look into the black win rate.
+
+### Win and draws by matchup
+We now look at specific matchups between different engines and look if the posterior distribution reasonably matches with the observed tournament data
+```{r, helper_function}
+check_by_group <- function(group, observed_values, simulated_values) {
+  groups <- split(seq_along(observed_values), group)
+
+  do.call(rbind, lapply(names(groups), function(label) {
+    rows <- groups[[label]]
+
+    observed_mean <- mean(observed_values[rows])
+    replicated_means <- colMeans(
+      simulated_values[rows, , drop = FALSE]
+    )
+
+    q <- quantile(replicated_means, c(0.05, 0.50, 0.95))
+
+    data.frame(
+      Group = label,
+      Games = length(rows),
+      Observed = observed_mean,
+      Predicted_median = q[[2]],
+      Lower_90 = q[[1]],
+      Upper_90 = q[[3]]
+    )
+  }))
+}
+```
+
+```{r}
+matchup <- paste(games$white, "vs", games$black)
+
+draws_by_matchup <- check_by_group(
+  matchup,
+  stan_data$outcome == 2L,
+  outcome_rep == 2L
+)
+
+white_wins_by_matchup <- check_by_group(
+  matchup,
+  stan_data$outcome == 1L,
+  outcome_rep == 1L
+)
+
+scores_by_matchup <- check_by_group(
+  matchup,
+  (stan_data$outcome == 1L) + 0.5 * (stan_data$outcome == 2L),
+  (outcome_rep == 1L) + 0.5 * (outcome_rep == 2L)
+)
+
+
+
+knitr::kable(draws_by_matchup, digits = 3)
+
+```
+
+In the first table we can observe that the model underpredicts draws for D playing White against E and overpredicts draws for E playing White against SM. This can be overlooked if we only look at the total number of draws in the whole tournament. 
+
+```{r}
+knitr::kable(white_wins_by_matchup, digits = 3)
+
+```
+SM as white vs A has the largest gap from the predictive median. SM won 7 of 28 games in the actual tournament, but the model predicted a median of 14 wins.
+
+```{r}
+knitr::kable(scores_by_matchup, digits = 3)
+```
+In here we look at the scores per matchup and can see that a total of five matchup scores lie outside their 90% posterior predictive intervals. The model underpredicts D’s score against E and E’s score against A, while overpredicting D’s score against SM and a few others. These discrepancies combined with the ones analyzed above clearely indicate that the model is yet not good enough in predicting oucomes reliably for specific matchups. 
+
+### Model revision: matchup-specific adjustment
+
+We extend the model with an Elo adjustment for each unordered engine pair. The adjustment changes sign when the colors reverse, allowing an engine to perform better against a particular opponent in either color.
+
+For game \(n\), we define
+
+$$
+\Delta_n = R_{\text{Black},n} - (R_{\text{White},n} + \text{whiteAdvantage} + \text{matchupDirection} \cdot \text{paireff}_{p(n)}),
+$$
+$$
+e_n = \frac{1}{1 + 10^{\Delta_n/400}},
+$$
+
+where , $p(n)$ identifies the engine pair, and matchup direction is $+1$ when White has the smaller engine
+ID and $-1$ otherwise.
+
+To model paireff we use a hierarchical prior
+
+$$
+\text{pair}_{raw} \sim \mathcal{N}(0,1)
+$$
+$$
+\text{matchup}_{sd} \sim \operatorname{HalfNormal}(0,50)
+$$
+
+$$
+\text{parieff} = \text{matchup}_{sd} \cdot \text{pair}_{raw}.
+$$
+where $\text{pair}_{raw}$ is modeled for every unorderd pair and $\text{matchup}_{sd}$ is modeled over all games and all matchups. The shared scale allows the data to inform the amount of matchup variation while shrinking weakly supported effects toward zero. We retain the existing draw model and repeat the posterior predictive checks to assess the new model.
+
+
+### Data preperation
+```{r}
+stan_data_pairs <- stan_data
+
+# All unordered engine pairs
+pairs <- combn(seq_along(engines), 2)
+P <- ncol(pairs)
+
+pair_lookup <- matrix(0L, length(engines), length(engines))
+
+for (p in seq_len(P)) {
+  i <- pairs[1, p]
+  j <- pairs[2, p]
+
+  pair_lookup[i, j] <- p
+  pair_lookup[j, i] <- p
+}
+
+stan_data_pairs$P <- P
+
+stan_data_pairs$pair_id <- pair_lookup[
+  cbind(stan_data$white, stan_data$black)
+]
+
+# Positive effects favor the engine with the smaller ID
+stan_data_pairs$matchup_direction <- ifelse(
+  stan_data$white < stan_data$black, 1L, -1L
+)
+
+stopifnot(all(stan_data_pairs$pair_id >= 1L))
+
+# Labels for interpreting the fitted effects
+pair_labels <- paste(
+  engines[pairs[1, ]],
+  "vs",
+  engines[pairs[2, ]]
+)
+```
+
+
+### Fit model
+
+```{r}
+mod_pairs <- cmdstan_model("helpers/rating_three_outcomes_second_iteration.stan")
+
+fit_pairs <- mod_pairs$sample(
+  data = stan_data_pairs,
+  seed = 42
+)
+
+fit_pairs$summary(
+  variables = c("white_advantage", "matchup_sd", "pair_effect")
+)
+
+fit_pairs$diagnostic_summary()
+```
+
+
+
+### Simulate Tournament
+
+```{r}
+rating_names <- paste0("rating[", seq_along(engines), "]")
+pair_names <- paste0("pair_effect[", seq_len(P), "]")
+
+posterior_pairs <- as.matrix(fit_pairs$draws(
+  variables = c(
+    rating_names, pair_names,
+    "draw_tendency", "white_advantage"
+  ),
+  format = "draws_matrix"
+))
+
+ratings_pairs <- posterior_pairs[, rating_names, drop = FALSE]
+effects_pairs <- posterior_pairs[, pair_names, drop = FALSE]
+
+set.seed(42)
+
+outcome_rep_pairs <- vapply(seq_len(nrow(posterior_pairs)), function(s) {
+  white_rating <- as.numeric(ratings_pairs[s, stan_data_pairs$white])
+  black_rating <- as.numeric(ratings_pairs[s, stan_data_pairs$black])
+
+  adjustment <- as.numeric(stan_data_pairs$matchup_direction) *
+    as.numeric(effects_pairs[s, stan_data_pairs$pair_id])
+  
+  delta <- black_rating - (white_rating + 
+    as.numeric(posterior_pairs[s, "white_advantage"]) + adjustment)
+
+  e <- 1 / (1 + 10^(delta / 400))
+
+  p_draw <- 2 * posterior_pairs[s, "draw_tendency"] * e * (1 - e)
+  p_white <- e - 0.5 * p_draw
+
+  u <- runif(stan_data_pairs$N)
+
+  ifelse(u < p_white, 1L,
+         ifelse(u < p_white + p_draw, 2L, 3L))
+}, FUN.VALUE = integer(stan_data_pairs$N))
+```
+
+### Prepare the observed and simulated statistics
+```{r}
+observed_pairs <- stan_data_pairs$outcome
+
+observed_draw_pairs <- observed_pairs == 2L
+simulated_draw_pairs <- outcome_rep_pairs == 2L
+
+observed_white_win_pairs <- observed_pairs == 1L
+simulated_white_win_pairs <- outcome_rep_pairs == 1L
+
+observed_score_pairs <- (observed_pairs == 1L) +
+  0.5 * (observed_pairs == 2L)
+
+simulated_score_pairs <- (outcome_rep_pairs == 1L) +
+  0.5 * (outcome_rep_pairs == 2L)
+```
+
+### Overall draw count, including the histogram
+```{r}
+observed_draws_pairs <- sum(observed_draw_pairs)
+simulated_draws_pairs <- colSums(simulated_draw_pairs)
+
+hist(
+  simulated_draws_pairs,
+  main = "Matchup model: total draws",
+  xlab = "Number of draws per replicated tournament",
+  xlim = range(c(simulated_draws_pairs, observed_draws_pairs))
+)
+
+abline(v = observed_draws_pairs, col = "red", lwd = 2)
+
+observed_draws_pairs
+quantile(simulated_draws_pairs, c(0.05, 0.50, 0.95))
+```
+
+### Overall White-win count
+```{r}
+observed_white_wins_pairs <- sum(observed_white_win_pairs)
+replicated_white_wins_pairs <- colSums(simulated_white_win_pairs)
+
+hist(
+  replicated_white_wins_pairs,
+  main = "Matchup model: total White wins",
+  xlab = "Number of White wins per replicated tournament",
+  xlim = range(c(
+    replicated_white_wins_pairs,
+    observed_white_wins_pairs
+  ))
+)
+
+abline(v = observed_white_wins_pairs, col = "red", lwd = 2)
+
+observed_white_wins_pairs
+quantile(replicated_white_wins_pairs, c(0.05, 0.50, 0.95))
+```
+
+### Overall White mean score
+```{r}
+observed_white_score_pairs <- mean(observed_score_pairs)
+replicated_white_scores_pairs <- colMeans(simulated_score_pairs)
+
+observed_white_score_pairs
+quantile(replicated_white_scores_pairs, c(0.05, 0.50, 0.95))
+```
+
+### Draw rates by matchup
+```{r}
+matchup_pairs <- paste(games$white, "vs", games$black)
+
+draws_by_matchup_pairs <- check_by_group(
+  matchup_pairs,
+  observed_draw_pairs,
+  simulated_draw_pairs
+)
+
+knitr::kable(
+  draws_by_matchup_pairs,
+  digits = 3,
+  caption = "Matchup model: draw rate by matchup"
+)
+```
+We can still observe some discrepencies in the amount of draws predicted in some matchups. We will adress this in the next model iteration.
+
+### White win rate by matchup
+```{r}
+white_wins_by_matchup_pairs <- check_by_group(
+  matchup_pairs,
+  observed_white_win_pairs,
+  simulated_white_win_pairs
+)
+
+knitr::kable(
+  white_wins_by_matchup_pairs,
+  digits = 3,
+  caption = "Matchup model: White win rate by matchup"
+)
+```
+This overall looks fine now with some deviation for E vs A but it lies within the 90% range.
+
+### White’s mean score by matchup
+```{r}
+scores_by_matchup_pairs <- check_by_group(
+  matchup_pairs,
+  observed_score_pairs,
+  simulated_score_pairs
+)
+
+knitr::kable(
+  scores_by_matchup_pairs,
+  digits = 3,
+  caption = "Matchup model: White's mean score by matchup"
+)
+```
+
+All checks are passed with minor deviation, except for the drawrate. We experience a similar phenomenon as with the win and score. For certain matchups the ammount of draws lies outside the 90% interval. We will therefore also use a similar approach in fixing it by using drawrates for every matchup.
+
+### Model revision: Draw rate adjustment per matchup
+
+We therefore allow each unordered engine pair to have its own draw tendency, shared across both color arrangements.
+
+
+$$
+\text{matchupDrawAdjustment} \sim \mathcal{N}(0,1),
+\qquad
+\text{adjustedDrawTendency} = \operatorname{logit}^{-1} \left(\operatorname{logit}(\text{drawTendency})+\text{matchup DrawAdjustment}\right),
+$$
+
+Because we want the adjusted draw tendency to be in $[0, 1]$ we first use  logit before adding the adjustment and then converting to the interval using the inverse logit again. We then use this adjusted draw tendency the same way as before.
+
+
+### Fit the revised model
+```{r}
+mod_pair_draws <- cmdstan_model(
+  "helpers/rating_three_outcomes_third_iteration.stan"
+)
+
+fit_pair_draws <- mod_pair_draws$sample(
+  data = stan_data_pairs,
+  seed = 42
+)
+```
+
+
+### Inspect sampling diagnostics
+```{r}
+summary_pair_draws <- fit_pair_draws$summary(
+  variables = c(
+    "rating",
+    "white_advantage",
+    "matchup_sd",
+    "draw_tendency",
+    "pair_effect",
+    "draw_adjustment",
+    "adjusted_draw_tendency"
+  )
+)
+
+knitr::kable(
+  summary_pair_draws[, c(
+    "variable", "mean", "sd", "rhat", "ess_bulk", "ess_tail"
+  )],
+  digits = 3,
+  caption = "Pair-specific draw model: posterior summary"
+)
+
+fit_pair_draws$diagnostic_summary()
+```
+
+
+### Extract the posterior draws
+
+```{r}
+rating_names <- paste0(
+  "rating[", seq_along(engines), "]"
+)
+
+pair_names <- paste0(
+  "pair_effect[", seq_len(stan_data_pairs$P), "]"
+)
+
+draw_tendency_names <- paste0(
+  "adjusted_draw_tendency[",
+  seq_len(stan_data_pairs$P),
+  "]"
+)
+
+posterior_pair_draws <- as.matrix(fit_pair_draws$draws(
+  variables = c(
+    rating_names,
+    pair_names,
+    draw_tendency_names,
+    "white_advantage"
+  ),
+  format = "draws_matrix"
+))
+
+ratings_pair_draws <- posterior_pair_draws[
+  , rating_names, drop = FALSE
+]
+
+effects_pair_draws <- posterior_pair_draws[
+  , pair_names, drop = FALSE
+]
+
+tendencies_pair_draws <- posterior_pair_draws[
+  , draw_tendency_names, drop = FALSE
+]
+```
+
+### Simulate the tournaments
+
+```{r}
+set.seed(42)
+
+outcome_rep_pair_draws <- vapply(
+  seq_len(nrow(posterior_pair_draws)),
+  function(s) {
+
+    white_rating <- as.numeric(
+      ratings_pair_draws[s, stan_data_pairs$white]
+    )
+
+    black_rating <- as.numeric(
+      ratings_pair_draws[s, stan_data_pairs$black]
+    )
+
+    white_advantage_s <- as.numeric(
+      posterior_pair_draws[s, "white_advantage"]
+    )
+
+    adjustment <- as.numeric(
+      stan_data_pairs$matchup_direction
+    ) * as.numeric(
+      effects_pair_draws[s, stan_data_pairs$pair_id]
+    )
+
+    # Select the draw tendency for each game's engine pair
+    draw_tendency_game <- as.numeric(
+      tendencies_pair_draws[s, stan_data_pairs$pair_id]
+    )
+
+    stopifnot(
+      length(white_rating) == stan_data_pairs$N,
+      length(black_rating) == stan_data_pairs$N,
+      length(adjustment) == stan_data_pairs$N,
+      length(draw_tendency_game) == stan_data_pairs$N
+    )
+
+    delta <- black_rating -
+      (white_rating + white_advantage_s + adjustment)
+
+    e <- 1 / (1 + 10^(delta / 400))
+
+    p_draw <- 2 * draw_tendency_game * e * (1 - e)
+    p_white <- e - 0.5 * p_draw
+
+    u <- runif(stan_data_pairs$N)
+
+    ifelse(
+      u < p_white,
+      1L,
+      ifelse(u < p_white + p_draw, 2L, 3L)
+    )
+  },
+  FUN.VALUE = integer(stan_data_pairs$N)
+)
+```
+Each column of outcome_rep_pair_draws is one simulated tournament. Each row corresponds to the same game as in games and stan_data_pairs.
+
+### Prepare all checking statistics
+
+```{r}
+observed_pair_draws <- stan_data_pairs$outcome
+
+observed_draw_pair_draws <- observed_pair_draws == 2L
+simulated_draw_pair_draws <- outcome_rep_pair_draws == 2L
+
+observed_white_win_pair_draws <- observed_pair_draws == 1L
+simulated_white_win_pair_draws <- outcome_rep_pair_draws == 1L
+
+observed_black_win_pair_draws <- observed_pair_draws == 3L
+simulated_black_win_pair_draws <- outcome_rep_pair_draws == 3L
+
+observed_score_pair_draws <-
+  as.numeric(observed_white_win_pair_draws) +
+  0.5 * observed_draw_pair_draws
+
+simulated_score_pair_draws <-
+  simulated_white_win_pair_draws +
+  0.5 * simulated_draw_pair_draws
+```
+
+### Overall draw count
+```{r}
+observed_draws_pair_draws <- sum(observed_draw_pair_draws)
+replicated_draws_pair_draws <- colSums(simulated_draw_pair_draws)
+
+hist(
+  replicated_draws_pair_draws,
+  main = "Pair-specific draw model: total draws",
+  xlab = "Draws per replicated tournament",
+  xlim = range(c(
+    replicated_draws_pair_draws,
+    observed_draws_pair_draws
+  ))
+)
+
+abline(v = observed_draws_pair_draws, col = "red", lwd = 2)
+
+observed_draws_pair_draws
+quantile(replicated_draws_pair_draws, c(0.05, 0.50, 0.95))
+```
+
+### Overall White-win count
+```{r}
+observed_white_wins_pair_draws <-
+  sum(observed_white_win_pair_draws)
+
+replicated_white_wins_pair_draws <-
+  colSums(simulated_white_win_pair_draws)
+
+hist(
+  replicated_white_wins_pair_draws,
+  main = "Pair-specific draw model: total White wins",
+  xlab = "White wins per replicated tournament",
+  xlim = range(c(
+    replicated_white_wins_pair_draws,
+    observed_white_wins_pair_draws
+  ))
+)
+
+abline(v = observed_white_wins_pair_draws, col = "red", lwd = 2)
+
+observed_white_wins_pair_draws
+quantile(replicated_white_wins_pair_draws, c(0.05, 0.50, 0.95))
+```
+
+### Overall Black-win count and White’s mean score
+```{r}
+# Black wins
+observed_black_wins_pair_draws <-
+  sum(observed_black_win_pair_draws)
+
+replicated_black_wins_pair_draws <-
+  colSums(simulated_black_win_pair_draws)
+
+observed_black_wins_pair_draws
+quantile(replicated_black_wins_pair_draws, c(0.05, 0.50, 0.95))
+
+# White's mean score
+observed_white_score_pair_draws <- mean(observed_score_pair_draws)
+replicated_white_scores_pair_draws <- colMeans(simulated_score_pair_draws)
+
+observed_white_score_pair_draws
+quantile(replicated_white_scores_pair_draws, c(0.05, 0.50, 0.95))
+```
+### Draw rates by matchup
+
+```{r}
+matchup_pair_draws <- paste(games$white, "vs", games$black)
+
+draws_by_matchup_pair_draws <- check_by_group(
+  matchup_pair_draws,
+  observed_draw_pair_draws,
+  simulated_draw_pair_draws
+)
+
+knitr::kable(
+  draws_by_matchup_pair_draws,
+  digits = 3,
+  caption = "Pair-specific draw model: draw rate by matchup"
+)
+```
+
+### White-win rates by matchup
+```{r}
+white_wins_by_matchup_pair_draws <- check_by_group(
+  matchup_pair_draws,
+  observed_white_win_pair_draws,
+  simulated_white_win_pair_draws
+)
+
+knitr::kable(
+  white_wins_by_matchup_pair_draws,
+  digits = 3,
+  caption = "Pair-specific draw model: White win rate by matchup"
+)
+```
+
+### White’s mean score by matchup
+```{r}
+scores_by_matchup_pair_draws <- check_by_group(
+  matchup_pair_draws,
+  observed_score_pair_draws,
+  simulated_score_pair_draws
+)
+
+knitr::kable(
+  scores_by_matchup_pair_draws,
+  digits = 3,
+  caption = "Pair-specific draw model: White's mean score by matchup"
+)
+```
+
+Pair specific draw tendencies improve the reproduction of our matchup draw rates. All observed White win rates and mean scores lie within their displayed 90% posterior predictive intervals. One draw-rate discrepancy remains for C playing White against A, where all three games were draws. Given the small sample, we acknowledge but ignore this small error.
+I therefore concider this part of the optimization complete for the non time control model.
+
+```{r}
+
+```
+## Time controll model
+
+### Data Preparation for Stan
+
+```{r}
+# Engine identifiers
+engines <- sort(unique(c(games$white, games$black)))
+
+# Convert time controls into expected game duration
+parts <- strsplit(games$timecontrol, "\\+")
+
+tc <- vapply(parts, function(p) {
+  as.numeric(p[1]) + 40 * as.numeric(p[2])
+}, numeric(1))
+
+# Standardize time control
+tc_center <- mean(tc)
+tc_scale <- sd(tc)
+stopifnot(is.finite(tc_scale), tc_scale > 0)
+
+x <- (tc - tc_center) / tc_scale
+
+# Encode the three game outcomes
+outcome_levels <- c("1-0", "1/2-1/2", "0-1")
+
+# Data for the time-control model
+stan_data_tc <- list(
+  N = nrow(games),
+  K = length(engines),
+  white = match(games$white, engines),
+  black = match(games$black, engines),
+  outcome = match(games$result, outcome_levels),
+  x = as.numeric(x)
+)
+```
+
+### Posterior Sampling
+
+```{r}
+# Compile time-control model
+mod_tc <- cmdstan_model("helpers/rating_timecontrol.stan")
+
+# Sample from the posterior
+fit_tc <- mod_tc$sample(
+  data = stan_data_tc,
+  seed = 42
+)
+```
+### Replicate tournament
+```{r}
+# Extract posterior draws from the time-control model
+intercept_names <- paste0("intercept[", seq_along(engines), "]")
+slope_names <- paste0("slope[", seq_along(engines), "]")
+
+posterior_tc <- as.matrix(fit_tc$draws(
+  variables = c(intercept_names, slope_names, "draw_tendency"),
+  format = "draws_matrix"
+))
+
+intercepts_tc <- posterior_tc[, intercept_names, drop = FALSE]
+slopes_tc <- posterior_tc[, slope_names, drop = FALSE]
+draw_tendency_tc <- posterior_tc[, "draw_tendency"]
+
+# One simulated tournament per posterior draw
+set.seed(42)
+
+outcome_rep_tc <- vapply(seq_len(nrow(posterior_tc)), function(s) {
+
+  # Use each game's standardized time control from the fitted data
+  white_rating <- intercepts_tc[s, stan_data_tc$white] +
+    slopes_tc[s, stan_data_tc$white] * stan_data_tc$x
+
+  black_rating <- intercepts_tc[s, stan_data_tc$black] +
+    slopes_tc[s, stan_data_tc$black] * stan_data_tc$x
+
+  # Same probabilities as in rating_timecontrol.stan
+  e <- plogis(log(10) / 400 * (white_rating - black_rating))
+
+  p_draw <- 2 * draw_tendency_tc[s] * e * (1 - e)
+  p_white <- e - 0.5 * p_draw
+
+  u <- runif(stan_data_tc$N)
+
+  ifelse(u < p_white, 1L,
+         ifelse(u < p_white + p_draw, 2L, 3L))
+
+}, FUN.VALUE = integer(stan_data_tc$N))
+
+# Observed and simulated statistics for the time-control model
+observed_tc <- stan_data_tc$outcome
+
+observed_draw_tc <- observed_tc == 2L
+simulated_draw_tc <- outcome_rep_tc == 2L
+
+observed_score_tc <- (observed_tc == 1L) + 0.5 * (observed_tc == 2L)
+
+simulated_score_tc <- (outcome_rep_tc == 1L) + 0.5 * (outcome_rep_tc == 2L)
+```
+
+### Time controll analysis
+
+```{r}
+# Total draws
+sum(observed_draw_tc)
+quantile(
+  colSums(simulated_draw_tc),
+  c(0.05, 0.50, 0.95)
+)
+
+# Total White wins
+sum(observed_tc == 1L)
+quantile(
+  colSums(outcome_rep_tc == 1L),
+  c(0.05, 0.50, 0.95)
+)
+
+# White's mean score
+mean(observed_score_tc)
+quantile(
+  colMeans(simulated_score_tc),
+  c(0.05, 0.50, 0.95)
+)
+```
+
+```{r}
+matchup <- paste(games$white, "vs", games$black)
+
+draws_by_tc <- check_by_group(
+  games$timecontrol, observed_draw_tc, simulated_draw_tc
+)
+
+scores_by_tc <- check_by_group(
+  games$timecontrol, observed_score_tc, simulated_score_tc
+)
+
+draws_by_matchup_tc <- check_by_group(
+  matchup, observed_draw_tc, simulated_draw_tc
+)
+
+scores_by_matchup_tc <- check_by_group(
+  matchup, observed_score_tc, simulated_score_tc
+)
+
+knitr::kable(
+  draws_by_tc, digits = 3,
+  caption = "Time-control model: draw rate by time control"
+)
+
+knitr::kable(
+  scores_by_tc, digits = 3,
+  caption = "Time-control model: White's mean score by time control"
+)
+
+knitr::kable(
+  draws_by_matchup_tc, digits = 3,
+  caption = "Time-control model: draw rate by matchup"
+)
+
+knitr::kable(
+  scores_by_matchup_tc, digits = 3,
+  caption = "Time-control model: White's mean score by matchup"
+)
+```
+### Model adjustment: White advantage
+In the same fashion as in the non timecontrol model we now add a constant white advantage for all to adress the underprediction of whit wins.
+
+### Fit the revised model
+```{r}
+mod_tc_1 <- cmdstan_model(
+  "helpers/rating_timecontrol_first_iteration.stan"
+)
+
+fit_tc_1 <- mod_tc_1$sample(
+  data = stan_data_tc,
+  seed = 42
+)
+
+fit_tc_1$diagnostic_summary()
+
+fit_tc_1$summary(
+  variables = c("white_advantage", "draw_tendency")
+)
+```
+
+
+### Extract posterior draws
+
+```{r}
+intercept_names <- paste0(
+  "intercept[", seq_along(engines), "]"
+)
+
+slope_names <- paste0(
+  "slope[", seq_along(engines), "]"
+)
+
+posterior_tc_1 <- as.matrix(fit_tc_1$draws(
+  variables = c(
+    intercept_names,
+    slope_names,
+    "draw_tendency",
+    "white_advantage"
+  ),
+  format = "draws_matrix"
+))
+
+intercepts_tc_1 <- posterior_tc_1[
+  , intercept_names, drop = FALSE
+]
+
+slopes_tc_1 <- posterior_tc_1[
+  , slope_names, drop = FALSE
+]
+```
+
+### Simulate tournaments
+```{r}
+
+set.seed(42)
+
+outcome_rep_tc_1 <- vapply(
+  seq_len(nrow(posterior_tc_1)),
+  function(s) {
+
+    white_rating <- as.numeric(
+      intercepts_tc_1[s, stan_data_tc$white]
+    ) + as.numeric(
+      slopes_tc_1[s, stan_data_tc$white]
+    ) * as.numeric(stan_data_tc$x)
+
+    black_rating <- as.numeric(
+      intercepts_tc_1[s, stan_data_tc$black]
+    ) + as.numeric(
+      slopes_tc_1[s, stan_data_tc$black]
+    ) * as.numeric(stan_data_tc$x)
+
+    white_advantage_s <- as.numeric(
+      posterior_tc_1[s, "white_advantage"]
+    )
+
+    draw_tendency_s <- as.numeric(
+      posterior_tc_1[s, "draw_tendency"]
+    )
+
+    e <- 1 / (1 + 10^(
+      (black_rating - (white_rating + white_advantage_s)) / 400
+    ))
+
+    p_draw <- 2 * draw_tendency_s * e * (1 - e)
+    p_white <- e - 0.5 * p_draw
+
+    u <- runif(stan_data_tc$N)
+
+    ifelse(
+      u < p_white,
+      1L,
+      ifelse(u < p_white + p_draw, 2L, 3L)
+    )
+  },
+  FUN.VALUE = integer(stan_data_tc$N)
+)
+```
+
+### Check the overall White-win count
+```{r}
+
+observed_white_wins_tc_1 <- sum(stan_data_tc$outcome == 1L)
+replicated_white_wins_tc_1 <- colSums(outcome_rep_tc_1 == 1L)
+
+hist(
+  replicated_white_wins_tc_1,
+  main = "Time-control model with White advantage: White wins",
+  xlab = "White wins per replicated tournament",
+  xlim = range(c(
+    replicated_white_wins_tc_1,
+    observed_white_wins_tc_1
+  ))
+)
+
+abline(v = observed_white_wins_tc_1, col = "red", lwd = 2)
+
+observed_white_wins_tc_1
+quantile(replicated_white_wins_tc_1, c(0.05, 0.50, 0.95))
+
+```
+
+### Check the overall draw count
+```{r}
+observed_draws_tc_1 <- sum(stan_data_tc$outcome == 2L)
+replicated_draws_tc_1 <- colSums(outcome_rep_tc_1 == 2L)
+
+hist(
+  replicated_draws_tc_1,
+  main = "Time-control model with White advantage: draws",
+  xlab = "Draws per replicated tournament",
+  xlim = range(c(
+    replicated_draws_tc_1,
+    observed_draws_tc_1
+  ))
+)
+
+abline(v = observed_draws_tc_1, col = "red", lwd = 2)
+
+observed_draws_tc_1
+quantile(replicated_draws_tc_1, c(0.05, 0.50, 0.95))
+```
+
+### Check White’s overall mean score
+```{r}
+observed_scores_tc_1 <-
+  (stan_data_tc$outcome == 1L) +
+  0.5 * (stan_data_tc$outcome == 2L)
+
+replicated_scores_tc_1 <-
+  (outcome_rep_tc_1 == 1L) +
+  0.5 * (outcome_rep_tc_1 == 2L)
+
+mean(observed_scores_tc_1)
+quantile(
+  colMeans(replicated_scores_tc_1),
+  c(0.05, 0.50, 0.95)
+)
+```
+Now we were able to fix the white win count discrepency as in the non time control model.
+
+We now take our attention to the draw, win and score distribution by matchup and timcontrol.
+
+```{r}
+matchup_tc_1 <- paste(games$white, "vs", games$black)
+
+observed_draw_tc_1 <- stan_data_tc$outcome == 2L
+simulated_draw_tc_1 <- outcome_rep_tc_1 == 2L
+
+observed_score_tc_1 <- (stan_data_tc$outcome == 1L) +
+  0.5 * (stan_data_tc$outcome == 2L)
+
+simulated_score_tc_1 <- (outcome_rep_tc_1 == 1L) +
+  0.5 * (outcome_rep_tc_1 == 2L)
+
+draws_by_tc_1 <- check_by_group(
+  games$timecontrol, observed_draw_tc_1, simulated_draw_tc_1
+)
+
+scores_by_tc_1 <- check_by_group(
+  games$timecontrol, observed_score_tc_1, simulated_score_tc_1
+)
+
+draws_by_matchup_tc_1 <- check_by_group(
+  matchup_tc_1, observed_draw_tc_1, simulated_draw_tc_1
+)
+
+scores_by_matchup_tc_1 <- check_by_group(
+  matchup_tc_1, observed_score_tc_1, simulated_score_tc_1
+)
+
+knitr::kable(
+  draws_by_tc_1, digits = 3,
+  caption = "Time-control model, iteration 1: draw rate by time control"
+)
+
+knitr::kable(
+  scores_by_tc_1, digits = 3,
+  caption = "Time-control model, iteration 1: White's mean score by time control"
+)
+
+knitr::kable(
+  draws_by_matchup_tc_1, digits = 3,
+  caption = "Time-control model, iteration 1: draw rate by matchup"
+)
+
+knitr::kable(
+  scores_by_matchup_tc_1, digits = 3,
+  caption = "Time-control model, iteration 1: White's mean score by matchup"
+)
+```
+
+Adding White advantage improves the reproduction of scores across time controls: all observed group mean scores lie within their displayed 90% posterior predictive intervals. However, several matchup score and draw-rate discrepancies persist. We therefore investigate pair-specific Elo adjustments as the next model revision, again analogous to the approach above.
+
+### Add our existing pair information to the time-control data
+
+We already created stan_data_pairs. So we reuse its mapping after verifying that the games and engine IDs align.
+
+```{r}
+stopifnot(
+  stan_data_tc$K == stan_data_pairs$K,
+  identical(stan_data_tc$white, stan_data_pairs$white),
+  identical(stan_data_tc$black, stan_data_pairs$black),
+  identical(stan_data_tc$outcome, stan_data_pairs$outcome)
+)
+
+stan_data_tc_2 <- stan_data_tc
+
+stan_data_tc_2$P <- stan_data_pairs$P
+stan_data_tc_2$pair_id <- stan_data_pairs$pair_id
+stan_data_tc_2$matchup_direction <-
+  stan_data_pairs$matchup_direction
+```
+
+### Fit the model and inspect diagnostics
+```{r}
+
+mod_tc_2 <- cmdstan_model(
+  "helpers/rating_timecontrol_second_iteration.stan"
+)
+
+fit_tc_2 <- mod_tc_2$sample(
+  data = stan_data_tc_2,
+  seed = 42
+)
+
+fit_tc_2$diagnostic_summary()
+
+fit_tc_2$summary(
+  variables = c(
+    "intercept", "slope",
+    "white_advantage", "draw_tendency",
+    "matchup_sd", "pair_effect"
+  )
+)
+```
+
+
+### Extract draws and simulate tournaments
+```{r}
+intercept_names <- paste0(
+  "intercept[", seq_along(engines), "]"
+)
+
+slope_names <- paste0(
+  "slope[", seq_along(engines), "]"
+)
+
+pair_names <- paste0(
+  "pair_effect[", seq_len(stan_data_tc_2$P), "]"
+)
+
+posterior_tc_2 <- as.matrix(fit_tc_2$draws(
+  variables = c(
+    intercept_names, slope_names, pair_names,
+    "white_advantage", "draw_tendency"
+  ),
+  format = "draws_matrix"
+))
+
+intercepts_tc_2 <- posterior_tc_2[
+  , intercept_names, drop = FALSE
+]
+
+slopes_tc_2 <- posterior_tc_2[
+  , slope_names, drop = FALSE
+]
+
+effects_tc_2 <- posterior_tc_2[
+  , pair_names, drop = FALSE
+]
+
+set.seed(42)
+
+outcome_rep_tc_2 <- vapply(
+  seq_len(nrow(posterior_tc_2)),
+  function(s) {
+
+    white_rating <- as.numeric(
+      intercepts_tc_2[s, stan_data_tc_2$white]
+    ) + as.numeric(
+      slopes_tc_2[s, stan_data_tc_2$white]
+    ) * as.numeric(stan_data_tc_2$x)
+
+    black_rating <- as.numeric(
+      intercepts_tc_2[s, stan_data_tc_2$black]
+    ) + as.numeric(
+      slopes_tc_2[s, stan_data_tc_2$black]
+    ) * as.numeric(stan_data_tc_2$x)
+
+    adjustment <- as.numeric(
+      stan_data_tc_2$matchup_direction
+    ) * as.numeric(
+      effects_tc_2[s, stan_data_tc_2$pair_id]
+    )
+
+    white_advantage_s <- as.numeric(
+      posterior_tc_2[s, "white_advantage"]
+    )
+
+    draw_tendency_s <- as.numeric(
+      posterior_tc_2[s, "draw_tendency"]
+    )
+
+    delta <- black_rating -
+      (white_rating + white_advantage_s + adjustment)
+
+    e <- 1 / (1 + 10^(delta / 400))
+
+    p_draw <- 2 * draw_tendency_s * e * (1 - e)
+    p_white <- e - 0.5 * p_draw
+
+    u <- runif(stan_data_tc_2$N)
+
+    ifelse(
+      u < p_white,
+      1L,
+      ifelse(u < p_white + p_draw, 2L, 3L)
+    )
+  },
+  FUN.VALUE = integer(stan_data_tc_2$N)
+)
+```
+### Repeat the overall checks
+```{r}
+observed_tc_2 <- stan_data_tc_2$outcome
+
+observed_draw_tc_2 <- observed_tc_2 == 2L
+simulated_draw_tc_2 <- outcome_rep_tc_2 == 2L
+
+observed_white_win_tc_2 <- observed_tc_2 == 1L
+simulated_white_win_tc_2 <- outcome_rep_tc_2 == 1L
+
+observed_score_tc_2 <- (observed_tc_2 == 1L) +
+  0.5 * (observed_tc_2 == 2L)
+
+simulated_score_tc_2 <- (outcome_rep_tc_2 == 1L) +
+  0.5 * (outcome_rep_tc_2 == 2L)
+
+# Total draws
+sum(observed_draw_tc_2)
+quantile(colSums(simulated_draw_tc_2), c(0.05, 0.50, 0.95))
+
+# Total White wins
+sum(observed_white_win_tc_2)
+quantile(colSums(simulated_white_win_tc_2), c(0.05, 0.50, 0.95))
+
+# Total Black wins
+sum(observed_tc_2 == 3L)
+quantile(colSums(outcome_rep_tc_2 == 3L), c(0.05, 0.50, 0.95))
+
+# White's mean score
+mean(observed_score_tc_2)
+quantile(colMeans(simulated_score_tc_2), c(0.05, 0.50, 0.95))
+
+```
+
+### Repeat the grouped checks
+```{r}
+
+matchup_tc_2 <- paste(games$white, "vs", games$black)
+
+draws_by_matchup_tc_2 <- check_by_group(
+  matchup_tc_2, observed_draw_tc_2, simulated_draw_tc_2
+)
+
+white_wins_by_matchup_tc_2 <- check_by_group(
+  matchup_tc_2, observed_white_win_tc_2, simulated_white_win_tc_2
+)
+
+scores_by_matchup_tc_2 <- check_by_group(
+  matchup_tc_2, observed_score_tc_2, simulated_score_tc_2
+)
+
+draws_by_tc_2 <- check_by_group(
+  games$timecontrol, observed_draw_tc_2, simulated_draw_tc_2
+)
+
+scores_by_tc_2 <- check_by_group(
+  games$timecontrol, observed_score_tc_2, simulated_score_tc_2
+)
+
+knitr::kable(
+  draws_by_matchup_tc_2, digits = 3,
+  caption = "Time-control iteration 2: draw rate by matchup"
+)
+
+knitr::kable(
+  white_wins_by_matchup_tc_2, digits = 3,
+  caption = "Time-control iteration 2: White win rate by matchup"
+)
+
+knitr::kable(
+  scores_by_matchup_tc_2, digits = 3,
+  caption = "Time-control iteration 2: White's mean score by matchup"
+)
+
+knitr::kable(
+  draws_by_tc_2, digits = 3,
+  caption = "Time-control iteration 2: draw rate by time control"
+)
+
+knitr::kable(
+  scores_by_tc_2, digits = 3,
+  caption = "Time-control iteration 2: White's mean score by time control"
+)
+```
+
+The pair-specific Elo adjustments improve the score predictions. The remaining discrepancies are mainly in draws. Because we again face the same issue as in the non timecontrol model we also use the same fix. Therefore we introduce a pair specific draw rate adjustment.
+
+### Model adjustment: Pair specific draw rate adjustment
+
+
+### Compile and fit
+```{r}
+mod_tc_3 <- cmdstan_model(
+  "helpers/rating_timecontrol_third_iteration.stan"
+)
+
+fit_tc_3 <- mod_tc_3$sample(
+  data = stan_data_tc_2,
+  seed = 42
+)
+```
+### Check sampling diagnostics
+
+```{r}
+fit_tc_3$diagnostic_summary()
+
+summary_tc_3 <- fit_tc_3$summary(
+  variables = c(
+    "intercept", "slope",
+    "white_advantage", "matchup_sd",
+    "pair_effect", "draw_tendency",
+    "draw_adjustment", "adjusted_draw_tendency"
+  )
+)
+
+knitr::kable(
+  summary_tc_3[, c(
+    "variable", "mean", "sd", "rhat", "ess_bulk", "ess_tail"
+  )],
+  digits = 3,
+  caption = "Time-control iteration 3: posterior summary"
+)
+```
+###Extract posterior draws
+
+```{r}
+intercept_names <- paste0(
+  "intercept[", seq_along(engines), "]"
+)
+
+slope_names <- paste0(
+  "slope[", seq_along(engines), "]"
+)
+
+pair_names <- paste0(
+  "pair_effect[", seq_len(stan_data_tc_2$P), "]"
+)
+
+draw_names <- paste0(
+  "adjusted_draw_tendency[", seq_len(stan_data_tc_2$P), "]"
+)
+
+posterior_tc_3 <- as.matrix(fit_tc_3$draws(
+  variables = c(
+    intercept_names, slope_names, pair_names,
+    draw_names, "white_advantage"
+  ),
+  format = "draws_matrix"
+))
+
+intercepts_tc_3 <- posterior_tc_3[
+  , intercept_names, drop = FALSE
+]
+
+slopes_tc_3 <- posterior_tc_3[
+  , slope_names, drop = FALSE
+]
+
+effects_tc_3 <- posterior_tc_3[
+  , pair_names, drop = FALSE
+]
+
+draw_tendencies_tc_3 <- posterior_tc_3[
+  , draw_names, drop = FALSE
+]
+```
+### Simulate tournaments
+```{r}
+set.seed(42)
+
+outcome_rep_tc_3 <- vapply(
+  seq_len(nrow(posterior_tc_3)),
+  function(s) {
+
+    white_rating <- as.numeric(
+      intercepts_tc_3[s, stan_data_tc_2$white]
+    ) + as.numeric(
+      slopes_tc_3[s, stan_data_tc_2$white]
+    ) * as.numeric(stan_data_tc_2$x)
+
+    black_rating <- as.numeric(
+      intercepts_tc_3[s, stan_data_tc_2$black]
+    ) + as.numeric(
+      slopes_tc_3[s, stan_data_tc_2$black]
+    ) * as.numeric(stan_data_tc_2$x)
+
+    adjustment <- as.numeric(
+      stan_data_tc_2$matchup_direction
+    ) * as.numeric(
+      effects_tc_3[s, stan_data_tc_2$pair_id]
+    )
+
+    white_advantage_s <- as.numeric(
+      posterior_tc_3[s, "white_advantage"]
+    )
+
+    draw_tendency_game <- as.numeric(
+      draw_tendencies_tc_3[s, stan_data_tc_2$pair_id]
+    )
+
+    stopifnot(
+      length(adjustment) == stan_data_tc_2$N,
+      length(draw_tendency_game) == stan_data_tc_2$N
+    )
+
+    delta <- black_rating -
+      (white_rating + white_advantage_s + adjustment)
+
+    e <- 1 / (1 + 10^(delta / 400))
+
+    p_draw <- 2 * draw_tendency_game * e * (1 - e)
+    p_white <- e - 0.5 * p_draw
+
+    u <- runif(stan_data_tc_2$N)
+
+    ifelse(
+      u < p_white,
+      1L,
+      ifelse(u < p_white + p_draw, 2L, 3L)
+    )
+  },
+  FUN.VALUE = integer(stan_data_tc_2$N)
+)
+```
+
+### Prepare checking statistics
+```{r}
+observed_tc_3 <- stan_data_tc_2$outcome
+
+observed_draw_tc_3 <- observed_tc_3 == 2L
+simulated_draw_tc_3 <- outcome_rep_tc_3 == 2L
+
+observed_white_win_tc_3 <- observed_tc_3 == 1L
+simulated_white_win_tc_3 <- outcome_rep_tc_3 == 1L
+
+observed_score_tc_3 <- (observed_tc_3 == 1L) +
+  0.5 * (observed_tc_3 == 2L)
+
+simulated_score_tc_3 <- (outcome_rep_tc_3 == 1L) +
+  0.5 * (outcome_rep_tc_3 == 2L)
+```
+
+### Overall draw count
+
+```{r}
+observed_draws_tc_3 <- sum(observed_draw_tc_3)
+replicated_draws_tc_3 <- colSums(simulated_draw_tc_3)
+
+hist(
+  replicated_draws_tc_3,
+  main = "Time-control iteration 3: total draws",
+  xlab = "Draws per replicated tournament",
+  xlim = range(c(replicated_draws_tc_3, observed_draws_tc_3))
+)
+
+abline(v = observed_draws_tc_3, col = "red", lwd = 2)
+
+observed_draws_tc_3
+quantile(replicated_draws_tc_3, c(0.05, 0.50, 0.95))
+```
+### Overall White-win count
+```{r}
+observed_white_wins_tc_3 <- sum(observed_white_win_tc_3)
+replicated_white_wins_tc_3 <- colSums(simulated_white_win_tc_3)
+
+hist(
+  replicated_white_wins_tc_3,
+  main = "Time-control iteration 3: total White wins",
+  xlab = "White wins per replicated tournament",
+  xlim = range(c(
+    replicated_white_wins_tc_3,
+    observed_white_wins_tc_3
+  ))
+)
+
+abline(v = observed_white_wins_tc_3, col = "red", lwd = 2)
+
+observed_white_wins_tc_3
+quantile(replicated_white_wins_tc_3, c(0.05, 0.50, 0.95))
+```
+
+### Overall Black-win count and White’s mean score
+```{r}
+# Black wins
+observed_black_wins_tc_3 <- sum(observed_tc_3 == 3L)
+replicated_black_wins_tc_3 <- colSums(outcome_rep_tc_3 == 3L)
+
+observed_black_wins_tc_3
+quantile(replicated_black_wins_tc_3, c(0.05, 0.50, 0.95))
+
+# White's mean score
+mean(observed_score_tc_3)
+quantile(
+  colMeans(simulated_score_tc_3),
+  c(0.05, 0.50, 0.95)
+)
+```
+
+### Checks by matchup
+```{r}
+matchup_tc_3 <- paste(games$white, "vs", games$black)
+
+draws_by_matchup_tc_3 <- check_by_group(
+  matchup_tc_3,
+  observed_draw_tc_3,
+  simulated_draw_tc_3
+)
+
+white_wins_by_matchup_tc_3 <- check_by_group(
+  matchup_tc_3,
+  observed_white_win_tc_3,
+  simulated_white_win_tc_3
+)
+
+scores_by_matchup_tc_3 <- check_by_group(
+  matchup_tc_3,
+  observed_score_tc_3,
+  simulated_score_tc_3
+)
+
+knitr::kable(
+  draws_by_matchup_tc_3, digits = 3,
+  caption = "Time-control iteration 3: draw rate by matchup"
+)
+
+knitr::kable(
+  white_wins_by_matchup_tc_3, digits = 3,
+  caption = "Time-control iteration 3: White win rate by matchup"
+)
+
+knitr::kable(
+  scores_by_matchup_tc_3, digits = 3,
+  caption = "Time-control iteration 3: White's mean score by matchup"
+)
+```
+### Checks by time control
+```{r}
+draws_by_tc_3 <- check_by_group(
+  games$timecontrol,
+  observed_draw_tc_3,
+  simulated_draw_tc_3
+)
+
+white_wins_by_tc_3 <- check_by_group(
+  games$timecontrol,
+  observed_white_win_tc_3,
+  simulated_white_win_tc_3
+)
+
+scores_by_tc_3 <- check_by_group(
+  games$timecontrol,
+  observed_score_tc_3,
+  simulated_score_tc_3
+)
+
+knitr::kable(
+  draws_by_tc_3, digits = 3,
+  caption = "Time-control iteration 3: draw rate by time control"
+)
+
+knitr::kable(
+  white_wins_by_tc_3, digits = 3,
+  caption = "Time-control iteration 3: White win rate by time control"
+)
+
+knitr::kable(
+  scores_by_tc_3, digits = 3,
+  caption = "Time-control iteration 3: White's mean score by time control"
+)
+
+```
+
+Allowing pair-specific draw tendencies improves the reproduction of matchup draw rates. All displayed win-rate and mean-score observations lie within their respective 90% posterior predictive intervals as desired. Draw rates are also covered except for C playing White against A, but here only three games were played and all were draws. Some smaller differences remain, including overprediction of draws at 180+0. We acknowledge these smaller mispredictions but keep this model for now.
+

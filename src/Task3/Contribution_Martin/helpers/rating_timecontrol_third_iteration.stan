@@ -1,0 +1,86 @@
+data {
+  int<lower=1> N;
+  int<lower=1> K;
+
+  array[N] int<lower=1, upper=K> white;
+  array[N] int<lower=1, upper=K> black;
+  array[N] int<lower=1, upper=3> outcome;
+
+  vector[N] x;  // Standardized time control
+
+  int<lower=1> P;
+  array[N] int<lower=1, upper=P> pair_id;
+  array[N] int<lower=-1, upper=1> matchup_direction;
+}
+
+parameters {
+  vector[K] intercept;  // Base ratings
+  vector[K] slope;     // Time-control effects
+
+  real<lower=0, upper=1> draw_tendency;
+  real white_advantage;
+
+  vector[P] pair_raw;
+  real<lower=0> matchup_sd;
+
+  vector[P] draw_adjustment;
+}
+
+transformed parameters {
+  vector[P] pair_effect;
+  vector<lower=0, upper=1>[P] adjusted_draw_tendency;
+
+  pair_effect = matchup_sd * pair_raw;
+
+  
+  adjusted_draw_tendency =
+    inv_logit(logit(draw_tendency) + draw_adjustment);
+}
+
+model {
+  // Priors
+  intercept ~ normal(2000, 200);
+  slope ~ normal(0, 100);
+  draw_tendency ~ beta(1, 1);
+  white_advantage ~ normal(0, 50);
+
+  pair_raw ~ std_normal();
+  matchup_sd ~ normal(0, 50);
+
+  draw_adjustment ~ normal(0, 1);
+
+  for (n in 1:N) {
+    real rating_white;
+    real rating_black;
+    real e;
+    real p_draw;
+    vector[3] p;
+    real delta;
+    real adjustment;
+
+    // Time-dependent ratings
+    rating_white =
+      intercept[white[n]] + slope[white[n]] * x[n];
+
+    rating_black =
+      intercept[black[n]] + slope[black[n]] * x[n];
+
+    // Pair-specific Elo adjustment
+    adjustment =
+      matchup_direction[n] * pair_effect[pair_id[n]];
+
+    delta = rating_black -
+      (rating_white + white_advantage + adjustment);
+
+    e = 1 / (1 + pow(10.0, delta / 400));
+
+    // adjusted_draw_tendency
+    p_draw = 2 * adjusted_draw_tendency[pair_id[n]] * e * (1 - e);
+
+    p[1] = e - 0.5 * p_draw;       // White wins
+    p[2] = p_draw;                 // Draw
+    p[3] = 1 - e - 0.5 * p_draw;   // Black wins
+
+    outcome[n] ~ categorical(p);
+  }
+}
