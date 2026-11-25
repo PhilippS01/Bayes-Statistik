@@ -18,7 +18,7 @@ output:
 ```{r setup, include=FALSE}
 # Global chunk options
 knitr::opts_chunk$set(
-  echo = TRUE,
+  echo = FALSE,
   warning = FALSE,
   message = FALSE,
   fig.width = 8,
@@ -97,7 +97,7 @@ engines
 table(games$result)
 ```
 
-# Task 1: Bayesian Rating Model
+# Task 1: Tournament Ranking
 
 ## Model
 
@@ -105,7 +105,7 @@ We used the following model including draws tendency.
 
 <explain model based on stan>
 
-```{r, echo=FALSE}
+```{r}
 # Get unique engine names
 engines <- sort(unique(c(games$white, games$black)))
 
@@ -125,7 +125,7 @@ stan_data <- list(
 
 We use Stan to sample the unknown model parameters (engine ratings and draw tendency) from their joint posterior distribution, given the observed game results.
 
-```{r, echo=FALSE, results='hide'}
+```{r, results='hide'}
 # Compile Stan model
 stan_task1 <- "helpers/stan_task1.stan"
 mod_task1 <- cmdstan_model(stan_task1)
@@ -143,7 +143,7 @@ We summarize the posterior distributions of the engine ratings and assess the di
 
 ### Engine Rankings
 
-```{r, echo=FALSE}
+```{r}
 # Extract posterior rating draws
 draws <- fit_task1$draws(
   variables = "rating",
@@ -185,7 +185,7 @@ the absolute value of a rating isn't that informative.
 
 ### Pairwise Superiority
 
-```{r, echo=FALSE}
+```{r}
 # Pairwise superiority probabilities
 pairwise <- matrix(NA_real_, length(engines), length(engines),
                    dimnames = list(engines, engines))
@@ -210,19 +210,11 @@ We define superiority as a posterior probability of at least 95% that one engine
 | 3 | C, B |
 | 4 | D |
 
-# Task 2: 
+# Task 2: Tournament Ranking with Time Control 
 
-## Collecting Ideas
+## Model
 
-When reading the assignment I have 2 main ideas:
-
-- Idea 1: we assume that different time controls represent different game modes, therefore different distributions in rating. My first idea would be to model a hierarchical model capturing the different populations of games assuming a general underlying player strength.
-
-- Idea 2: Besides the general underlying player strength players could have strength in different game modes eg., R1 \> R2 for one game mode but R1 \< R2 in a different game mode.
-
-## Continue with Idea 2
-
-By further reading, I think Idea 2 is expected one. Therefore I will continue with that one as we by the note we assume linear dependence of timecontrol, ie.:
+Following the assignment's hint, we extend the model from Task 1 by assuming a linear dependence of engine ratings on the time control:
 
 $$\boxed{R_j(t_c)=\alpha_j+\beta_j x(t_c)}$$
 
@@ -231,8 +223,6 @@ where $x(t_c)$ is the z-scaled game duration.
 - $\alpha_j$: Base strength of engine $j$, modeled in exactly the same way as \(R_j\) in Task 1 (with draws).
 - $\beta_j$: How its strength changes with thinking time, with $$\beta_j\sim\mathcal N(0,100^2).$$
 - $t_c=\text{time}+40\cdot\text{increment}$: time as a numeric variable.
-
-### Data Preparation for Stan
 
 ```{r}
 # Engine identifiers
@@ -266,22 +256,22 @@ stan_data_tc <- list(
 )
 ```
 
-### Posterior Sampling
-
 ```{r, results='hide'}
 # Compile time-control model
-mod_tc <- cmdstan_model("helpers/rating_timecontrol.stan")
+mod_task2 <- cmdstan_model("helpers/stan_task2.stan")
 
 # Sample from the posterior
-fit_tc <- mod_tc$sample(
+fit_task2 <- mod_task2$sample(
   data = stan_data_tc,
   seed = 42
 )
 ```
 
-```{r, echo=FALSE}
+## Results
+
+```{r}
 # Parameter estimates and MCMC diagnostics
-summary_tc <- fit_tc$summary(
+summary_tc <- fit_task2$summary(
   variables = c("intercept", "slope", "draw_tendency")
 )
 
@@ -296,11 +286,9 @@ knitr::kable(
 
 The MCMC diagnostics indicate satisfactory sampling performance. All R-hat values are close to 1, all bulk effective sample sizes exceed 1,000 and all tail effective sample sizes exceed 100. Thus, the sampling diagnostics do not indicate convergence problems.
 
-# Results
-
-```{r, echo=FALSE}
+```{r}
 # Extract estimated baseline ratings
-base_ranking <- fit_tc$summary(variables = "intercept")
+base_ranking <- fit_task2$summary(variables = "intercept")
 
 base_ranking$Engine <- engines
 
@@ -320,11 +308,11 @@ The estimated ratings at the average time control are very similar to those obta
 
 ```{r}
 # Extract posterior samples for base ratings and time effects
-alpha <- as.matrix(fit_tc$draws(
+alpha <- as.matrix(fit_task2$draws(
   variables = "intercept", format = "draws_matrix"
 ))
 
-beta <- as.matrix(fit_tc$draws(
+beta <- as.matrix(fit_task2$draws(
   variables = "slope", format = "draws_matrix"
 ))
 
@@ -379,7 +367,7 @@ tier_ranking <- function(t) {
 }
 ```
 
-```{r, echo=FALSE}
+```{r}
 # Generate tier lists for the four requested time controls
 knitr::kable(tier_ranking(15), digits = 1, caption = "Tier List: 15+0")
 
