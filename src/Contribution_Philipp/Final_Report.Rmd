@@ -101,9 +101,29 @@ table(games$result)
 
 ## Model
 
-We used the following model including draws tendency.
+We use the following Bayesian Elo rating model to account for wins, draws, and losses.
 
-<explain model based on stan>
+Each engine $j$ has an unknown rating $R_j$, with independent priors
+
+$$R_j \sim \mathcal{N}(2000,200^2).$$
+
+For a game between a white engine $i$ and a black engine $j$, the expected score of White is given by the Elo formula:
+
+$$e = \frac{1}{1+10^{(R_j-R_i)/400}}.$$
+
+To account for draws, we introduce a shared draw-tendency parameter $d$, with prior
+
+$$d \sim \operatorname{Beta}(1,1).$$
+
+The probabilities of the three possible outcomes are then defined as
+
+$$\begin{aligned}
+p_{\mathrm{draw}} &= 2de(1-e),\\
+p_{\mathrm{white}} &= e-\frac12 p_{\mathrm{draw}},\\
+p_{\mathrm{black}} &= 1-e-\frac12 p_{\mathrm{draw}}.
+\end{aligned}$$
+
+Finally, the observed game outcome is modeled using a categorical distribution with these three probabilities.
 
 ```{r}
 # Get unique engine names
@@ -177,9 +197,9 @@ knitr::kable(ranking, digits = 3)
 
 The MCMC diagnostics indicate satisfactory sampling performance, with R-hat values below 1.01, bulk ESS above 1000, and tail ESS above 100 for all engine ratings.
 
-Notice as 
+Notice as
 
-$$R_j - Ri = (R_j + m) - (R_i + m)$$
+$$R_j - R_i = (R_j + m) - (R_i + m)$$
 
 the absolute value of a rating isn't that informative.
 
@@ -204,13 +224,13 @@ knitr::kable(round(pairwise, 3))
 We define superiority as a posterior probability of at least 95% that one engine has a higher rating than another.
 
 | Tier | Engines |
-|---|---|
-| 1 | E |
-| 2 | A, SM |
-| 3 | C, B |
-| 4 | D |
+|------|---------|
+| 1    | E       |
+| 2    | A, SM   |
+| 3    | C, B    |
+| 4    | D       |
 
-# Task 2: Tournament Ranking with Time Control 
+# Task 2: Tournament Ranking with Time Control
 
 ## Model
 
@@ -220,7 +240,7 @@ $$\boxed{R_j(t_c)=\alpha_j+\beta_j x(t_c)}$$
 
 where $x(t_c)$ is the z-scaled game duration.
 
-- $\alpha_j$: Base strength of engine $j$, modeled in exactly the same way as \(R_j\) in Task 1 (with draws).
+- $\alpha_j$: Base strength of engine $j$, modeled in exactly the same way as $R_j$ in Task 1 (with draws).
 - $\beta_j$: How its strength changes with thinking time, with $$\beta_j\sim\mathcal N(0,100^2).$$
 - $t_c=\text{time}+40\cdot\text{increment}$: time as a numeric variable.
 
@@ -256,6 +276,8 @@ stan_data_tc <- list(
 )
 ```
 
+We use Stan to sample from the joint posterior distribution, increasing the number of sampling iterations per chain to 1,500 to improve Monte Carlo precision.
+
 ```{r, results='hide'}
 # Compile time-control model
 mod_task2 <- cmdstan_model("helpers/stan_task2.stan")
@@ -263,7 +285,8 @@ mod_task2 <- cmdstan_model("helpers/stan_task2.stan")
 # Sample from the posterior
 fit_task2 <- mod_task2$sample(
   data = stan_data_tc,
-  seed = 42
+  seed = 42,
+  iter_sampling = 1500
 )
 ```
 
@@ -284,7 +307,7 @@ knitr::kable(
 )
 ```
 
-The MCMC diagnostics indicate satisfactory sampling performance. All R-hat values are close to 1, all bulk effective sample sizes exceed 1,000 and all tail effective sample sizes exceed 100. Thus, the sampling diagnostics do not indicate convergence problems.
+The MCMC diagnostics indicate satisfactory sampling performance. All R-hat values are close to 1, all bulk effective sample sizes exceed 1,000 and all tail effective sample sizes exceed 100. Thus, the sampling diagnostics do not indicate convergence problems and suggest good chain mixing and sufficiently precise Monte Carlo estimates.
 
 ```{r}
 # Extract estimated baseline ratings
@@ -304,7 +327,7 @@ knitr::kable(
 )
 ```
 
-The estimated ratings at the average time control are very similar to those obtained in Task 1, yielding the same ranking: E > A > SM > C > B > D. Posterior standard deviations are also comparable. However, the time-dependent model additionally allows relative engine strengths to change across different time controls.
+The estimated ratings at the average time control are very similar to those obtained in Task 1, yielding the same ranking: E \> A \> SM \> C \> B \> D. Posterior standard deviations are also comparable. However, the time-dependent model additionally allows relative engine strengths to change across different time controls.
 
 ```{r}
 # Extract posterior samples for base ratings and time effects
@@ -323,27 +346,39 @@ rating_at_time <- function(t) {
 }
 ```
 
-We visualize the posterior mean ratings across different time controls to examine how engine strength changes with game duration.
+We visualize the posterior mean ratings and their 90% credible intervals across different time controls to examine how engine strength and uncertainty change with game duration.
 
 ```{r}
-# Define time controls from 15 to 600 seconds
+# Define time controls for visualization
 times <- seq(15, 600, length.out = 100)
 
-# Calculate expected ratings for each engine and time control
-ratings <- t(sapply(times, function(t) {
-  colMeans(rating_at_time(t))
-}))
+# Posterior mean and 90% credible intervals over time
+plot_data <- purrr::map_dfr(times, function(t) {
+  ratings <- rating_at_time(t)
+
+  tibble(
+    Time = t,
+    Engine = engines,
+    Mean = colMeans(ratings),
+    Lower = apply(ratings, 2, quantile, 0.05),
+    Upper = apply(ratings, 2, quantile, 0.95)
+  )
+})
 
 # Plot time-dependent ratings for all engines
-matplot(times, ratings, type = "l", lty = 1,
-        xlab = "Time Control (seconds)",
-        ylab = "Expected Rating")
-
-legend("topright", legend = engines,
-       col = 1:6, lty = 1, bty = "n")
+ggplot(plot_data,
+       aes(x = Time, y = Mean, color = Engine, fill = Engine)) +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper),
+              alpha = 0.10, color = NA) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    x = "Time Control (seconds)",
+    y = "Expected Rating"
+  ) +
+  theme_minimal()
 ```
 
-The plot shows that Engine E remains the strongest, while the other engines exhibit different time-dependent trends, motivating separate tier lists for the four specified time controls.
+The plot shows that Engine E remains the strongest, while the other engines exhibit different time-dependent trends, motivating separate tier lists for the four specified time controls. The model allows us to estimate engine ratings at different time controls, which is not directly observed in the dataset.
 
 ```{r}
 # Rank engines based on their ratings at a given time control
@@ -358,25 +393,47 @@ tier_ranking <- function(t) {
   })
 
   # Assign a new tier if superiority probability exceeds 95%
-  data.frame(
+  result <- data.frame(
     Tier = c(1, 1 + cumsum(p >= 0.95)),
     Engine = engines[idx],
     Mean = means[idx],
     SD = apply(draws, 2, sd)[idx]
   )
+  
+  rownames(result) <- NULL
+return(result)
 }
 ```
 
 ```{r}
-# Generate tier lists for the four requested time controls
-knitr::kable(tier_ranking(15), digits = 1, caption = "Tier List: 15+0")
-
-knitr::kable(tier_ranking(60), digits = 1, caption = "Tier List: 60+0")
-
-knitr::kable(tier_ranking(260), digits = 1, caption = "Tier List: 180+2")
-
-knitr::kable(tier_ranking(600), digits = 1, caption = "Tier List: 600+0")
+# Generate tier lists in a 2x2 layout
+knitr::kable(
+  list(tier_ranking(15), tier_ranking(60)),
+  digits = 1,
+  row.names = FALSE,
+  booktabs = TRUE,
+  caption = "Tier Lists: 15+0 (left) and 60+0 (right)"
+)
 ```
 
-Engine E consistently occupies the highest tier, while the remaining rankings change with time control. Particularly at 600+0, increased posterior uncertainty prevents a clear separation of the other engines under our 95% superiority criterion.
+```{r}
+knitr::kable(
+  list(tier_ranking(260), tier_ranking(600)),
+  digits = 1,
+  row.names = FALSE,
+  booktabs = TRUE,
+  caption = "Tier Lists: 180+2 (left) and 600+0 (right)"
+)
+
+```
+
+Engine E (Stockfish) consistently occupies the highest tier, while the remaining rankings change with time control. Particularly at 600+0, increased posterior uncertainty prevents a clear separation of the other engines under our 95% superiority criterion.
+
+# Task 3: Tournament Ranking Model Checking
+
+---
+<!-- TODO: Integrate and review existing PPC analyses. -->
+---
+
+# Task 4: Tournament Ranking Live Prediction 
 

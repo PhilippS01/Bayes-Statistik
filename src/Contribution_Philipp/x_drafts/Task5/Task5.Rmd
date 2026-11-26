@@ -83,3 +83,13 @@ games <- read.csv("../../../../data/games.csv")
 str(games)
 cat("Missing values:" , sum(is.na(games)))
 ```
+
+Exclude engine E.
+
+```{r}
+# Preserve the original dataset
+games_full <- games
+
+# Exclude games involving engine E
+games <- subset(games, white != "E" & black != "E")
+```
