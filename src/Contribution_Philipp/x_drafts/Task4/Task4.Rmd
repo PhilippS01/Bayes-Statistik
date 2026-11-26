@@ -1,5 +1,5 @@
 ---
-title: "Task Template"
+title: "Task 4: Tournament Ranking Live Prediction"
 subtitle: |
   105.173 Bayesian Statistics
 author: |
@@ -83,5 +83,286 @@ games <- read.csv("../../../../data/games.csv")
 str(games)
 cat("Missing values:" , sum(is.na(games)))
 ```
-# Task 4: Tournament Ranking Live Prediction 
 
+# Task 4: Tournament Ranking Live Prediction
+
+## Model
+
+Based on the posterior predictive checks in Task 3, we extend the time-dependent Elo model from Task 2 by introducing a shared White-advantage parameter $w$. This extension addresses the most prominent discrepancy in the initial model while keeping the model relatively simple. We assign the prior
+
+$$w\sim\mathcal N(0,50^2).$$
+
+The expected score for White becomes
+
+$$e=\frac{1}{1+10^{(R_B(t_c)-R_W(t_c)-w)/400}}.$$
+
+All remaining priors and the three-outcome likelihood are retained from Task 2.
+
+```{r}
+# Get unique engine names
+engines <- sort(unique(c(games$white, games$black)))
+
+# Convert time controls into expected game duration
+parts <- strsplit(games$timecontrol, "\\+")
+
+tc <- vapply(parts, function(p) {
+  as.numeric(p[1]) + 40 * as.numeric(p[2])
+}, numeric(1))
+
+# Standardize time control
+tc_center <- mean(tc)
+tc_scale <- sd(tc)
+x <- (tc - tc_center) / tc_scale
+
+# Encode outcomes
+outcome_levels <- c("1-0", "1/2-1/2", "0-1")
+
+# Prepare data for Stan
+stan_data_task4 <- list(
+  N = nrow(games),
+  K = length(engines),
+  white = match(games$white, engines),
+  black = match(games$black, engines),
+  outcome = match(games$result, outcome_levels),
+  x = as.numeric(x)
+)
+```
+
+```{r, results='hide'}
+# Compile Stan model
+mod_task4 <- cmdstan_model("helpers/task2_wa.stan")
+
+# Sample from the posterior distribution
+fit_task4 <- mod_task4$sample(
+  data = stan_data_task4,
+  seed = 42,
+  iter_sampling = 1500
+)
+```
+
+```{r}
+# Posterior summary and MCMC diagnostics
+summary_task4 <- fit_task4$summary(
+  variables = c(
+    "intercept", "slope",
+    "white_advantage", "draw_tendency"
+  )
+)
+
+# Display the shared parameters
+knitr::kable(
+  subset(
+    summary_task4,
+    variable %in% c("white_advantage", "draw_tendency"),
+    select = c(variable, mean, sd, rhat, ess_bulk, ess_tail)
+  ),
+  digits = 3
+)
+```
+
+```{r}
+# Check diagnostics across all parameters
+cat("Max R-hat:", max(summary_task4$rhat), "\n")
+cat("Min R-hat:", min(summary_task4$rhat), "\n")
+cat("Min Bulk ESS:", min(summary_task4$ess_bulk), "\n")
+cat("Min Tail ESS:", min(summary_task4$ess_tail), "\n")
+```
+
+The MCMC diagnostics indicate satisfactory sampling performance, with all R-hat values close to 1 and sufficiently high effective sample sizes. We therefore proceed with the extended model to predict the remaining tournament outcomes.
+
+## Simulation
+
+We estimate the probability that SchachMaus finishes among the top two engines using posterior predictive simulation. The tournament is played at a time control of 300+3, corresponding to an expected game duration of $t_c = 300 + 40 \cdot 3 = 420$ seconds.
+
+We first load the observed tournament scores after the first two rounds and calculate the current total points for each engine. The observed tournament scores are treated as fixed starting values and are not used to update the model posterior.
+
+```{r}
+# Load observed tournament scores after two rounds
+score_table <- read.csv(
+  "../../../../data/task4_scores.csv",
+  na.strings = ".",
+  check.names = FALSE
+)
+
+# Calculate current total points for each engine
+current_points <- rowSums(score_table[-1], na.rm = TRUE)
+names(current_points) <- score_table[[1]]
+
+# Match the order used in our Stan model
+current_points <- current_points[engines]
+
+cat("Current scores after two rounds:\n")
+print(current_points)
+```
+
+Starting from these observed scores, we simulate the remaining three rounds (90 games) using posterior samples from our extended model.
+
+For each simulation \(m\), we draw one joint sample of the model parameters from the posterior distribution and calculate the time-dependent rating of each engine at \(t_c=420\) seconds:
+
+\[
+R_j^{(m)}(420)=\alpha_j^{(m)}+\beta_j^{(m)}\frac{420-\overline{t_c}}{s_{t_c}}.
+\]
+
+Using these ratings and the corresponding White-advantage and draw-tendency parameters, we calculate the probabilities of a White win, draw, and Black win according to our extended model. The game outcomes are then randomly sampled from
+
+\[
+Y^{(m)} \sim \operatorname{Categorical}
+\left(p_W^{(m)},p_D^{(m)},p_B^{(m)}\right).
+\]
+
+For each of the 15 engine pairings, we simulate three games with each color configuration, resulting in 90 remaining games. The simulated points are added to the observed scores, producing one possible final tournament ranking.
+
+```{r}
+# Time control for the tournament: 300+3
+tc_tournament <- 300 + 40 * 3
+x_tournament <- (tc_tournament - tc_center) / tc_scale
+
+# Extract joint posterior samples
+posterior_draws <- fit_task4$draws(
+  variables = c(
+    "intercept", "slope",
+    "white_advantage", "draw_tendency"
+  ),
+  format = "draws_matrix"
+)
+
+# Simulate one possible continuation of the tournament
+simulate_tournament <- function(draw_id) {
+
+  # Select one joint posterior sample
+  intercept <- as.numeric(
+    posterior_draws[draw_id, paste0("intercept[", seq_along(engines), "]")]
+  )
+  
+  slope <- as.numeric(
+    posterior_draws[draw_id, paste0("slope[", seq_along(engines), "]")]
+  )
+  
+  w <- posterior_draws[draw_id, "white_advantage"]
+  d <- posterior_draws[draw_id, "draw_tendency"]
+
+  # Ratings at tournament time control
+  rating <- intercept + slope * x_tournament
+
+  # Start with the observed scores
+  points <- current_points
+
+  # Every engine plays every other engine
+  for (i in 1:(length(engines) - 1)) {
+    for (j in (i + 1):length(engines)) {
+
+      # Three games per color configuration
+      for (white in c(i, j)) {
+
+        black <- if (white == i) j else i
+
+        # Expected score for White
+        e <- 1 / (1 + 10^(
+          (rating[black] - rating[white] - w) / 400
+        ))
+
+        # Outcome probabilities
+        p_draw <- 2 * d * e * (1 - e)
+
+        probabilities <- c(
+          e - 0.5 * p_draw,       # White wins
+          p_draw,                 # Draw
+          1 - e - 0.5 * p_draw   # Black wins
+        )
+
+        # Simulate three games
+        white_points <- sum(sample(
+          c(1, 0.5, 0),
+          size = 3,
+          replace = TRUE,
+          prob = probabilities
+        ))
+
+        # Update scores
+        points[white] <- points[white] + white_points
+        points[black] <- points[black] + 3 - white_points
+      }
+    }
+  }
+
+  return(points)
+}
+```
+
+We repeat this procedure 10,000 times, obtaining a distribution of possible final tournament outcomes.
+
+```{r}
+# Simulate 10,000 tournament continuations
+set.seed(42)
+
+n_sim <- 10000
+
+draw_ids <- sample(
+  seq_len(nrow(posterior_draws)),
+  size = n_sim,
+  replace = TRUE
+)
+
+final_scores <- sapply(draw_ids, simulate_tournament)
+```
+
+## Results
+
+### Top-2 Probability
+
+We estimate the probability of SchachMaus finishing among the top two engines as the proportion of simulated tournaments in which SchachMaus achieves first or second place:
+
+\[
+\hat p_{\mathrm{top2}}=
+\frac{1}{M}\sum_{m=1}^{M}
+\mathbf{1}\left(\operatorname{rank}_{SM}^{(m)}\leq 2\right),
+\]
+
+where \(M=10{,}000\) is the number of simulated tournaments. Since no tie-breaking rule is specified, tied engines are ranked randomly.
+
+```{r}
+# Determine SchachMaus' rank in each simulation
+sm_id <- match("SM", engines)
+
+sm_ranks <- apply(final_scores, 2, function(scores) {
+  rank(-scores, ties.method = "random")[sm_id]
+})
+
+# Posterior predictive probability of finishing top two
+p_top2 <- mean(sm_ranks <= 2)
+```
+
+Based on 10,000 posterior predictive tournament simulations, the estimated probability of SchachMaus finishing among the top two engines is `r round(100 * p_top2, 2)`%.
+
+### Betting Decision
+
+We now evaluate the proposed €100 bet. If SchachMaus finishes first or second, we gain €100; otherwise, we lose €100.
+
+Using our estimated probability \(\hat p_{\mathrm{top2}}\), the expected net gain is
+
+\[
+\mathbb{E}[G]
+=100\hat p_{\mathrm{top2}}-100(1-\hat p_{\mathrm{top2}})
+=200\hat p_{\mathrm{top2}}-100.
+\]
+
+Thus, the bet has a positive expected gain if \(\hat p_{\mathrm{top2}}>0.5\).
+
+```{r}
+# Expected net gain from the bet
+expected_gain <- 200 * p_top2 - 100
+
+# Display results
+results <- data.frame(
+  `P(SM in top 2)` = round(p_top2, 4),
+  `Expected gain (EUR)` = round(expected_gain, 2),
+  check.names = FALSE
+)
+
+knitr::kable(
+  results,
+  caption = "Tournament Prediction and Betting Decision"
+)
+```
+
+The expected net gain is €`r round(expected_gain, 2)`. Since this value is positive, we would accept the bet under a risk-neutral decision criterion.
